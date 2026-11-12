@@ -1,0 +1,14 @@
+[package]
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+name = "legion-cpu-contract"
+version.workspace = true
+edition.workspace = true
+description = "CPU compatibility profiles and protocol state"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"

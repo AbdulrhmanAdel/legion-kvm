@@ -1,0 +1,29 @@
+name: Rust
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+      - name: Install development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev libegl-dev libgbm-dev libdrm-dev libsdl2-dev libvulkan-dev libx11-dev
+      - run: cargo fmt --all --check
+      - run: cargo check --locked --workspace --all-targets --all-features
+      - run: cargo test --locked --workspace --all-features
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo fmt --all --manifest-path backends/nvidia/Cargo.toml --check
+      - run: cargo clippy --locked --workspace --all-targets --manifest-path backends/nvidia/Cargo.toml --features device/vhost-user -- -D warnings
+      - run: cargo test --locked --workspace --manifest-path backends/nvidia/Cargo.toml --features device/vhost-user

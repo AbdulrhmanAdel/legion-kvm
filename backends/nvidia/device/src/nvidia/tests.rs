@@ -1,0 +1,2656 @@
+//! Unit tests for the backend.
+
+use super::*;
+
+#[cfg(test)]
+mod transport_release_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct Window {
+        calls: Arc<Mutex<Vec<(u64, u64)>>>,
+        fail: bool,
+    }
+
+    impl crate::shm::WindowPlacer for Window {
+        fn place(&self, _: u64, _: u64, _: RawFd, _: u64, _: bool) -> Result<()> {
+            Ok(())
+        }
+
+        fn withdraw(&self, offset: u64, len: u64) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("test window lock")
+                .push((offset, len));
+            if self.fail {
+                return Err(std::io::Error::other("test transport failure").into());
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn transport_release_notifies_vmm_before_reusing_an_extent() {
+        let mut backend = NvidiaBackend::for_test();
+        let before = backend.shm_free_bytes();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        backend.set_window(Box::new(Window {
+            calls: calls.clone(),
+            fail: false,
+        }));
+        let region = backend
+            .shm
+            .alloc(4096, crate::shm::PgprotKind::WriteCombine)
+            .expect("allocate test region");
+        backend
+            .release_mapped_region(&region)
+            .expect("release mapping");
+        assert_eq!(
+            *calls.lock().expect("test window lock"),
+            [(region.offset, region.length)]
+        );
+        assert_eq!(backend.shm_free_bytes(), before);
+        let reused = backend
+            .shm
+            .alloc(4096, crate::shm::PgprotKind::WriteCombine)
+            .expect("reuse test region");
+        assert_eq!(reused.offset, region.offset);
+    }
+
+    #[test]
+    fn transport_release_failure_keeps_the_extent_reserved() {
+        let mut backend = NvidiaBackend::for_test();
+        backend.set_window(Box::new(Window {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail: true,
+        }));
+        let region = backend
+            .shm
+            .alloc(4096, crate::shm::PgprotKind::WriteCombine)
+            .expect("allocate test region");
+        let reserved = backend.shm_free_bytes();
+        assert!(backend.release_mapped_region(&region).is_err());
+        assert_eq!(backend.shm_free_bytes(), reserved);
+        let next = backend
+            .shm
+            .alloc(4096, crate::shm::PgprotKind::WriteCombine)
+            .expect("allocate another region");
+        assert_ne!(next.offset, region.offset);
+    }
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+    use abi::ioctl::*;
+
+    fn t4_version_reply() -> Vec<u8> {
+        let mut b = vec![0u8; 72];
+        b[4] = 1; // reply = 1
+        b[8..18].copy_from_slice(b"580.178.04");
+        b
+    }
+
+    fn backend() -> NvidiaBackend {
+        NvidiaBackend::with_default_zones()
+    }
+
+    #[test]
+    fn no_profile_before_the_version_is_known() {
+        let b = backend();
+        assert_eq!(b.check_abi(NV_ESC_RM_CONTROL, 32), AbiCheck::NoProfile);
+    }
+
+    /// The flags are the release's own, not a version comparison written here. 535/580/595 have no DISABLE_PAGEABLE_ACCESS bit -- their mask is 0x3 -- and on those releases the backend has to establish the same thing by asking, which is what `pageable_must_be_off` says.
+    #[test]
+    fn uvm_initialize_always_gets_sharing_mode_and_no_hmm() {
+        use abi::version::DriverVersion as V;
+        for (v, flags, must_ask) in [
+            (V::new(535, 129, 3), 0x3, true),
+            (V::new(580, 178, 4), 0x3, true),
+            (V::new(595, 104, 2), 0x3, true),
+            (V::new(615, 71, 9), 0x7, false),
+        ] {
+            let sel = abi::uvm::select(v).expect("a table for every release here");
+            assert_eq!(sel.init_flags(), flags, "{v}");
+            assert_eq!(sel.pageable_must_be_off(), must_ask, "{v}");
+        }
+    }
+
+    #[test]
+    fn learns_the_driver_version_from_a_real_reply() {
+        let mut b = backend();
+        b.learn_driver_version(&t4_version_reply());
+        assert_eq!(
+            b.driver,
+            Some(abi::version::DriverVersion::new(580, 178, 4))
+        );
+        assert!(b.abi.is_some(), "580.178.04 must select a profile");
+    }
+
+    /// The property the tables exist for: an escape nobody described does not reach the host driver.
+    #[test]
+    fn an_escape_outside_the_profile_is_refused() {
+        let mut b = backend();
+        b.learn_driver_version(&t4_version_reply());
+        assert!(b.abi.is_some());
+
+        // 0x7f is not an NVIDIA escape and is in no profile.
+        assert_eq!(b.check_abi(0x7f, 16), AbiCheck::UnknownEscape);
+
+        // And a size the host does not agree with, on an escape that exists.
+        assert!(matches!(
+            b.check_abi(NV_ESC_RM_CONTROL, 31),
+            AbiCheck::SizeMismatch { .. }
+        ));
+    }
+
+    /// Before CHECK_VERSION_STR is answered there is no profile to check against, and refusing then would refuse the call that establishes one.
+    #[test]
+    fn nothing_is_refused_before_the_version_is_known() {
+        let b = backend();
+        assert_eq!(b.check_abi(NV_ESC_RM_CONTROL, 32), AbiCheck::NoProfile);
+    }
+
+    #[test]
+    fn accepts_the_sizes_the_t4_actually_sent() {
+        let mut b = backend();
+        b.learn_driver_version(&t4_version_reply());
+        for (escape, size) in [
+            (NV_ESC_RM_CONTROL, 32),
+            (NV_ESC_RM_ALLOC, 48),
+            (NV_ESC_RM_FREE, 16),
+            (NV_ESC_RM_MAP_MEMORY, 56),
+            (NV_ESC_RM_MAP_MEMORY_DMA, 64),
+            (NV_ESC_RM_UNMAP_MEMORY_DMA, 48),
+            (NV_ESC_RM_VID_HEAP_CONTROL, 184),
+        ] {
+            assert_eq!(
+                b.check_abi(escape, size),
+                AbiCheck::Ok,
+                "escape {escape:#04x} at {size} bytes was captured from hardware"
+            );
+        }
+    }
+
+    #[test]
+    fn catches_the_stale_map_memory_dma_size() {
+        // The hand-written table had this at 48; 580 uses NVOS46_PARAMETERS_V580, which is 64.
+        let mut b = backend();
+        b.learn_driver_version(&t4_version_reply());
+        assert_eq!(
+            b.check_abi(NV_ESC_RM_MAP_MEMORY_DMA, 48),
+            AbiCheck::SizeMismatch {
+                expected: 64,
+                actual: 48
+            }
+        );
+    }
+
+    #[test]
+    fn variable_length_escapes_are_not_size_checked() {
+        let mut b = backend();
+        b.learn_driver_version(&t4_version_reply());
+        // CARD_INFO is an array; the T4 sent 2304 bytes in one call.
+        assert_eq!(
+            b.check_abi(NV_ESC_CARD_INFO, 2304),
+            AbiCheck::VariableLength
+        );
+    }
+
+    #[test]
+    fn a_garbled_version_string_leaves_the_backend_unconfigured() {
+        let mut b = backend();
+        let mut junk = vec![0u8; 72];
+        junk[8..12].copy_from_slice(b"oops");
+        b.learn_driver_version(&junk);
+        assert!(b.driver.is_none());
+        assert_eq!(b.check_abi(NV_ESC_RM_CONTROL, 32), AbiCheck::NoProfile);
+    }
+
+    #[test]
+    fn a_short_reply_is_ignored_rather_than_panicking() {
+        let mut b = backend();
+        b.learn_driver_version(&[0u8; 4]);
+        assert!(b.driver.is_none());
+    }
+}
+
+#[cfg(test)]
+mod cases {
+    use super::*;
+
+    /// A request header.
+    fn hdr(msg_type: MsgType, handle: u64) -> Vec<u8> {
+        let mut v = vec![0u8; size_of::<MsgHeader>()];
+        write_struct(
+            &mut v,
+            &MsgHeader {
+                msg_type: msg_type as u32,
+                handle: handle as u32,
+                status: 0,
+                padding: 0,
+            },
+        );
+        v
+    }
+
+    /// `device_type` for an `OpenReq`, as the driver encodes it: a GPU is its own minor number and the singletons take values above every minor.
+    fn dev_type(kind: DeviceKind) -> u32 {
+        match kind {
+            DeviceKind::Gpu(n) => n,
+            DeviceKind::Ctl => DEV_CTL,
+            DeviceKind::Uvm => DEV_UVM,
+            DeviceKind::UvmTools => DEV_UVM_TOOLS,
+            DeviceKind::Modeset => DEV_MODESET,
+            DeviceKind::Dri(n) => DEV_DRI_BASE + n,
+        }
+    }
+
+    /// A complete `Open` message.
+    fn open_msg(kind: DeviceKind) -> Vec<u8> {
+        let mut v = hdr(MsgType::Open, 0);
+        append(
+            &mut v,
+            &OpenReq {
+                device_type: dev_type(kind),
+                flags: 0,
+            },
+        );
+        v
+    }
+
+    /// A complete `Close` message.
+    fn close_msg(handle: u64) -> Vec<u8> {
+        hdr(MsgType::Close, handle)
+    }
+
+    /// A complete `Ioctl` message with no nested block.
+    #[allow(dead_code)]
+    fn ioctl_msg(handle: u64, escape: u32, params: &[u8]) -> Vec<u8> {
+        let mut v = hdr(MsgType::Ioctl, handle);
+        append(
+            &mut v,
+            &IoctlReq {
+                cmd: abi::ioctl::_IOWR(escape, params.len() as u32) as u32,
+                data_len: params.len() as u32,
+                nested_offset: 0,
+                nested_len: 0,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        v.extend_from_slice(params);
+        v
+    }
+
+    fn append<T: Copy>(v: &mut Vec<u8>, val: &T) {
+        let start = v.len();
+        v.resize(start + size_of::<T>(), 0);
+        write_struct(&mut v[start..], val);
+    }
+
+    /// The response header.
+    fn parse_resp(buf: &[u8]) -> MsgHeader {
+        read_struct::<MsgHeader>(buf, 0)
+    }
+
+    /// Whether a response reports the errno `want` maps to.
+    fn is_err(buf: &[u8], want: Status) -> bool {
+        parse_resp(buf).status == -want.errno()
+    }
+
+    /// The handle an `Open` returned, which now arrives in the header.
+    fn opened_handle(buf: &[u8]) -> u64 {
+        parse_resp(buf).handle as u64
+    }
+
+    /// Offset of an ioctl response's parameter block.
+    const IOCTL_BODY: usize = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+
+    /// Whether the GPU-backed tests can run here.
+    #[track_caller]
+    fn nvidiactl_present() -> bool {
+        let present = std::path::Path::new("/dev/nvidiactl").exists();
+        if !present {
+            eprintln!(
+                "SKIP {}: needs /dev/nvidiactl; this test passes without testing anything",
+                std::panic::Location::caller()
+            );
+        }
+        present
+    }
+
+    // ---- error paths (no GPU required) ----
+
+    #[test]
+    fn open_invalid_gpu_index() {
+        let mut be = NvidiaBackend::for_test();
+        let req = open_msg(DeviceKind::Gpu(200));
+        let mut resp = vec![0u8; 64];
+        be.dispatch(&req, &mut resp);
+        assert!(is_err(&resp, Status::InvalidDevice));
+    }
+
+    #[test]
+    fn uvm_is_not_opened_without_compute() {
+        let mut be = NvidiaBackend::for_test();
+        assert!(!be.caps().has(crate::caps::COMPUTE), "compute is opt-in");
+        for kind in [DeviceKind::Uvm, DeviceKind::UvmTools] {
+            let mut resp = vec![0u8; 64];
+            be.dispatch(&open_msg(kind), &mut resp);
+            assert_eq!(parse_resp(&resp).status, -libc::ENODEV, "{kind:?}");
+        }
+        assert_eq!(be.handles.len(), 0);
+    }
+
+    /// The tools device pins user buffers and copies through process memory.
+    #[test]
+    fn uvm_tools_is_refused_even_with_compute() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_caps(crate::caps::Caps::parse("compute,graphics,video,utility").unwrap());
+        let mut resp = vec![0u8; 64];
+        be.dispatch(&open_msg(DeviceKind::UvmTools), &mut resp);
+        assert_eq!(parse_resp(&resp).status, -libc::ENODEV);
+        assert_eq!(be.handles.len(), 0);
+    }
+
+    #[test]
+    fn modeset_and_render_nodes_need_graphics() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_caps(crate::caps::Caps::parse("compute").unwrap());
+        for kind in [DeviceKind::Modeset, DeviceKind::Dri(0)] {
+            let mut resp = vec![0u8; 64];
+            be.dispatch(&open_msg(kind), &mut resp);
+            assert_eq!(parse_resp(&resp).status, -libc::ENODEV, "{kind:?}");
+        }
+        assert_eq!(be.handles.len(), 0);
+    }
+
+    /// A class outside the guest's capabilities is answered the way RM answers a class the GPU lacks, without calling the host.
+    #[test]
+    fn an_alloc_outside_the_caps_gets_invalid_class_from_us() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_caps(crate::caps::Caps::parse("graphics,compute").unwrap());
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+
+        let mut nvos64 = vec![0u8; 48];
+        nvos64[12..16].copy_from_slice(&0xc7b7u32.to_le_bytes()); // Ampere NVENC
+        let mut resp = vec![0u8; 256];
+        be.dispatch(
+            &ioctl_msg(h, abi::ioctl::NV_ESC_RM_ALLOC, &nvos64),
+            &mut resp,
+        );
+
+        assert_eq!(parse_resp(&resp).status, 0, "the ioctl itself succeeds");
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let status = u32::from_le_bytes(resp[body + 40..body + 44].try_into().unwrap());
+        assert_eq!(status, 0x22, "NV_ERR_INVALID_CLASS in NVOS64.status");
+    }
+
+    /// A fake host driver: records every request that reaches it and answers each one successfully without touching the parameters.
+    #[derive(Clone, Default)]
+    struct CountingHost(std::sync::Arc<std::sync::Mutex<Vec<u64>>>);
+
+    impl HostDriver for CountingHost {
+        fn ioctl(&self, _fd: RawFd, request: u64, _arg: &mut [u8]) -> std::result::Result<(), i32> {
+            self.0.lock().unwrap().push(request);
+            Ok(())
+        }
+    }
+
+    impl CountingHost {
+        fn calls(&self) -> Vec<u64> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn backend_on(host: &CountingHost) -> (NvidiaBackend, u64) {
+        let mut be = NvidiaBackend::for_test();
+        // A release, so the RM allowlist has tables to apply.
+        be.set_host_driver_version(abi::version::DriverVersion::new(615, 71, 9))
+            .expect("615.71.09 has tables");
+        be.set_host(Box::new(host.clone()));
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+        (be, h)
+    }
+
+    #[test]
+    fn failed_window_placements_do_not_consume_space() {
+        struct FailedWindow;
+        impl crate::shm::WindowPlacer for FailedWindow {
+            fn place(&self, _: u64, _: u64, _: RawFd, _: u64, _: bool) -> crate::error::Result<()> {
+                Err(std::io::Error::from_raw_os_error(libc::ENOMEM).into())
+            }
+            fn withdraw(&self, _: u64, _: u64) -> crate::error::Result<()> {
+                unreachable!("no mapping was placed")
+            }
+        }
+        for recorded in [false, true] {
+            for missing in [true, false] {
+                let host = CountingHost::default();
+                let (mut be, h) = backend_on(&host);
+                be.current_handle = h as u32;
+                if !missing {
+                    be.set_window(Box::new(FailedWindow));
+                }
+                let before = be.shm.free_bytes();
+                let mut params = [0u8; 56];
+                params[24..32].copy_from_slice(&4096u64.to_le_bytes());
+                params[48..52].copy_from_slice(&(h as u32).to_le_bytes());
+                for _ in 0..4 {
+                    let mut resp = [0u8; 256];
+                    if recorded {
+                        be.dispatch_map_memory(0, -1, 0, &params, &mut resp);
+                    } else {
+                        be.map_unrecorded(4096, 0, &mut resp);
+                    }
+                    let errno = if missing {
+                        libc::ENOTSUP
+                    } else if recorded {
+                        libc::ENOMEM
+                    } else {
+                        libc::EINVAL
+                    };
+                    assert_eq!(parse_resp(&resp).status, -errno);
+                    assert_eq!(
+                        be.shm.free_bytes(),
+                        before,
+                        "recorded={recorded}, missing={missing}"
+                    );
+                    assert!(be.live_maps.is_empty());
+                    assert!(!be.active_maps.fd_has_mapping(h));
+                    if missing {
+                        assert!(host.calls().is_empty(), "no window must not arm the host");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The seam itself: an allocation the guest may make reaches the host exactly once, through the trait and not around it.
+    #[test]
+    fn a_served_alloc_reaches_the_host_once() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        be.set_caps(crate::caps::Caps::parse("graphics,video").unwrap());
+
+        let mut nvos64 = vec![0u8; 48];
+        nvos64[12..16].copy_from_slice(&0xc7b7u32.to_le_bytes());
+        let mut resp = vec![0u8; 256];
+        be.dispatch(
+            &ioctl_msg(h, abi::ioctl::NV_ESC_RM_ALLOC, &nvos64),
+            &mut resp,
+        );
+
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(host.calls().len(), 1, "one host call: {:x?}", host.calls());
+    }
+
+    /// The other side of the seam: a refusal for want of a capability is answered here, and the fake proves the host never heard of it.
+    #[test]
+    fn a_caps_refusal_never_reaches_the_host() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        be.set_caps(crate::caps::Caps::parse("graphics,compute").unwrap());
+
+        let mut nvos64 = vec![0u8; 48];
+        nvos64[12..16].copy_from_slice(&0xc7b7u32.to_le_bytes());
+        let mut resp = vec![0u8; 256];
+        be.dispatch(
+            &ioctl_msg(h, abi::ioctl::NV_ESC_RM_ALLOC, &nvos64),
+            &mut resp,
+        );
+
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert!(
+            host.calls().is_empty(),
+            "host was called: {:x?}",
+            host.calls()
+        );
+    }
+
+    // ------------------------------------------------------------------ M4: RM's own privilege rule, applied on the guest's behalf.
+
+    fn rm_control(cmd: u32, params_size: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 32];
+        p[8..12].copy_from_slice(&cmd.to_le_bytes());
+        p[24..28].copy_from_slice(&params_size.to_le_bytes());
+        p
+    }
+
+    fn rm_alloc(class: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 48];
+        p[12..16].copy_from_slice(&class.to_le_bytes());
+        p
+    }
+
+    /// As `send_nested`, where the nested block has contents rather than being a length's worth of zeroes.
+    fn send_nested_bytes(
+        be: &mut NvidiaBackend,
+        h: u64,
+        escape: u32,
+        top: &[u8],
+        nested: &[u8],
+    ) -> Vec<u8> {
+        let mut v = hdr(MsgType::Ioctl, h);
+        append(
+            &mut v,
+            &IoctlReq {
+                cmd: abi::ioctl::_IOWR(escape, top.len() as u32) as u32,
+                data_len: top.len() as u32,
+                nested_offset: if nested.is_empty() { 0 } else { 16 },
+                nested_len: nested.len() as u32,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        v.extend_from_slice(top);
+        v.extend_from_slice(nested);
+        let mut resp = vec![0u8; 4096 + top.len() + nested.len()];
+        be.dispatch(&v, &mut resp);
+        resp
+    }
+
+    /// An ioctl whose top-level struct is followed by a nested block: the allocation parameters of an RM_ALLOC, or the parameter block of an RM_CONTROL.
+    fn send_nested(
+        be: &mut NvidiaBackend,
+        h: u64,
+        escape: u32,
+        top: &[u8],
+        nested: usize,
+    ) -> Vec<u8> {
+        let mut v = hdr(MsgType::Ioctl, h);
+        append(
+            &mut v,
+            &IoctlReq {
+                cmd: abi::ioctl::_IOWR(escape, top.len() as u32) as u32,
+                data_len: top.len() as u32,
+                nested_offset: if nested > 0 { 16 } else { 0 },
+                nested_len: nested as u32,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        v.extend_from_slice(top);
+        v.extend_from_slice(&vec![0u8; nested]);
+        // Big enough for the refusal to come back whole: GET_PIDS alone carries a few thousand handles.
+        let mut resp = vec![0u8; 4096 + top.len() + nested];
+        be.dispatch(&v, &mut resp);
+        assert_eq!(parse_resp(&resp).status, 0, "the ioctl itself must succeed");
+        resp
+    }
+
+    fn send_alloc(be: &mut NvidiaBackend, h: u64, class: u32, nested: usize) -> Vec<u8> {
+        send_nested(be, h, abi::ioctl::NV_ESC_RM_ALLOC, &rm_alloc(class), nested)
+    }
+
+    fn send_control(
+        be: &mut NvidiaBackend,
+        h: u64,
+        cmd: u32,
+        declared: u32,
+        sent: usize,
+    ) -> Vec<u8> {
+        send_nested(
+            be,
+            h,
+            abi::ioctl::NV_ESC_RM_CONTROL,
+            &rm_control(cmd, declared),
+            sent,
+        )
+    }
+
+    /// The whole point of the deny list.
+    #[test]
+    fn the_host_s_process_list_is_refused_and_never_asked_for() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let size = abi::rmallow::v615_71_09::CTRL
+            .iter()
+            .find(|e| e.cmd == 0x2080018d)
+            .expect("GET_PIDS is in the table RM exports")
+            .params_size;
+
+        send_control(&mut be, h, 0x2080018d, size, size as usize);
+        assert!(
+            host.calls().is_empty(),
+            "the host was asked for its process list: {:x?}",
+            host.calls()
+        );
+    }
+
+    /// A control RM does not export to an unprivileged caller.
+    #[test]
+    fn a_privileged_control_never_reaches_the_host() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        assert!(
+            !abi::rmallow::v615_71_09::CTRL
+                .iter()
+                .any(|e| e.cmd == 0x00000b01),
+            "SET_ACCOUNTING_STATE must not be in the allowlist"
+        );
+
+        send_control(&mut be, h, 0x00000b01, 8, 8);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+    }
+
+    /// The size has to be RM's size.
+    #[test]
+    fn a_control_at_the_wrong_size_never_reaches_the_host() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let e = abi::rmallow::v615_71_09::CTRL
+            .iter()
+            .find(|e| e.params_size > 8 && abi::rmallow::denied(e.cmd).is_none())
+            .expect("some control has parameters");
+
+        send_control(
+            &mut be,
+            h,
+            e.cmd,
+            e.params_size - 4,
+            e.params_size as usize - 4,
+        );
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+
+        // Declaring RM's size and sending less is refused too: RM copies the declared number of bytes, so the rest would be whatever follows.
+        send_control(&mut be, h, e.cmd, e.params_size, e.params_size as usize - 4);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+
+        // ...and the same control at RM's size goes through, or the tests above would pass for the wrong reason.
+        send_control(&mut be, h, e.cmd, e.params_size, e.params_size as usize);
+        assert_eq!(host.calls().len(), 1, "{:x?}", host.calls());
+    }
+
+    /// The three controls the probe runs caught the backend refusing while draw, encode and Vulkan all still needed them.
+    #[test]
+    fn the_controls_rm_serves_without_a_control_flag_reach_the_host() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+
+        // NV2080_CTRL_CMD_FB_GET_INFO, rewritten into FB_GET_INFO_V2.
+        send_control(&mut be, h, 0x2080_1301, 16, 16);
+        assert_eq!(host.calls().len(), 1, "{:x?}", host.calls());
+
+        // A GSP-forwarded command.
+        send_control(&mut be, h, 0x2080_852e, 64, 64);
+        assert_eq!(host.calls().len(), 2, "{:x?}", host.calls());
+
+        // A command for NV2081_BINAPI, whose control forwards anything.
+        send_control(&mut be, h, 0x2081_0108, 32, 32);
+        assert_eq!(host.calls().len(), 3, "{:x?}", host.calls());
+    }
+
+    /// The same paths refuse.
+    #[test]
+    fn the_same_paths_refuse_what_rm_refuses() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+
+        // Rewritten into a command RM marks privileged.
+        send_control(&mut be, h, 0x0073_136a, 64, 64);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+
+        // The same GSP-forwarded command with RM's privileged bits set: RM answers that one to root only, and the backend is root on nobody's behalf.
+        send_control(&mut be, h, 0x2080_c52e, 64, 64);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+
+        // RM copies no more than this for an unprivileged caller, and a size RM will not copy is a host allocation sized by the guest.
+        let max = be
+            .rmallow
+            .expect("the fixture learned a release")
+            .max_params();
+        send_control(&mut be, h, 0x2080_852e, max + 1, 64);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+
+        // The privileged twin of the catch-all class.
+        send_control(&mut be, h, 0x2082_0108, 32, 32);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+    }
+
+    /// The guest driver has to know how many bytes of allocation parameters to copy before it can forward anything, and `paramsSize` is usually zero, so it used a table compiled into the module.
+    #[test]
+    fn the_guest_is_told_what_rm_sizes_an_allocation_at() {
+        let host = CountingHost::default();
+        let (be, _h) = backend_on(&host);
+        let mut buf = vec![0u8; 8192];
+        let n = be.write_alloc_size_section(&mut buf);
+        assert!(n >= 8, "the section was not written");
+
+        let word = |i: usize| u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(word(0), NvidiaBackend::ALLOC_SIZE_MAGIC);
+        let count = word(1) as usize;
+        assert_eq!(n, 8 + count * 8);
+
+        let sizes: std::collections::BTreeMap<u32, u32> = (0..count)
+            .map(|i| (word(2 + i * 2), word(3 + i * 2)))
+            .collect();
+
+        // The two the probe runs caught, at RM's size for 615.71.09 rather than the 20 and 368 the module was built with.
+        assert_eq!(sizes.get(&0xa06c), Some(&28), "KEPLER_CHANNEL_GROUP_A");
+        assert_eq!(sizes.get(&0xc56f), Some(&376), "AMPERE_CHANNEL_GPFIFO_A");
+
+        // Every size is RM's own, and a class with no parameters is left out rather than sent as zero -- a zero would read as "copy nothing".
+        for c in abi::rmallow::v615_71_09::CLASS {
+            assert_eq!(
+                sizes.get(&c.class_id),
+                (c.params_size > 0).then_some(&c.params_size),
+                "class {:#x}",
+                c.class_id
+            );
+        }
+    }
+
+    /// Before the backend has learned a release it has nothing to say, and saying nothing has to mean nothing: the guest reads this section by a magic word for exactly that reason, and a zero-length section leaves it on the table it was built with.
+    #[test]
+    fn a_backend_with_no_release_sends_no_sizes() {
+        let be = NvidiaBackend::for_test();
+        let mut buf = vec![0u8; 8192];
+        assert_eq!(be.write_alloc_size_section(&mut buf), 0);
+        assert!(buf.iter().all(|b| *b == 0), "something was written anyway");
+    }
+
+    /// A class RM does not let an unprivileged caller allocate.
+    #[test]
+    fn a_class_rm_does_not_export_never_reaches_the_host() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let class = 0x0000dead;
+        assert!(
+            !abi::rmallow::v615_71_09::CLASS
+                .iter()
+                .any(|c| c.class_id == class)
+        );
+
+        send_alloc(&mut be, h, class, 0);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+    }
+
+    /// RS_REQUIRED means the allocation parameters have to be there.
+    #[test]
+    fn a_class_that_requires_parameters_is_refused_without_them() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let c = abi::rmallow::v615_71_09::CLASS
+            .iter()
+            .find(|c| c.params_required)
+            .expect("some class requires parameters");
+
+        send_alloc(&mut be, h, c.class_id, 0);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+
+        // Short is refused too: RM reads its own struct's worth of bytes through pAllocParms, so a short block is a read past what was sent.
+        send_alloc(&mut be, h, c.class_id, c.params_size as usize - 4);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+
+        send_alloc(&mut be, h, c.class_id, c.params_size as usize);
+        assert_eq!(host.calls().len(), 1, "{:x?}", host.calls());
+    }
+
+    /// A backend that never learned the host's release has no rule to apply, so it applies none of the guest's traffic to the host.
+    #[test]
+    fn nothing_is_served_without_a_release() {
+        let host = CountingHost::default();
+        let mut be = NvidiaBackend::for_test();
+        be.set_host(Box::new(host.clone()));
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+
+        send_alloc(&mut be, h, 0xc7b7, 12);
+        send_control(&mut be, h, 0x20800110, 8, 8);
+        assert!(host.calls().is_empty(), "{:x?}", host.calls());
+    }
+
+    #[test]
+    fn a_release_older_than_every_profile_is_refused() {
+        use abi::version::DriverVersion as V;
+        let mut be = NvidiaBackend::for_test();
+        assert!(be.set_host_driver_version(V::new(470, 0, 0)).is_err());
+        assert!(be.driver.is_none());
+        assert!(be.set_host_driver_version(V::new(595, 104, 2)).is_ok());
+        assert_eq!(be.driver, Some(V::new(595, 104, 2)));
+    }
+
+    #[test]
+    fn close_unknown_handle() {
+        let mut be = NvidiaBackend::for_test();
+        let req = close_msg(0xCAFE);
+        let mut resp = vec![0u8; 32];
+        be.dispatch(&req, &mut resp);
+        assert!(is_err(&resp, Status::BadHandle));
+    }
+
+    #[test]
+    fn short_request_rejected() {
+        let mut be = NvidiaBackend::for_test();
+        be.dispatch(&[0u8; 4], &mut [0u8; 32]);
+        // just must not panic
+    }
+
+    // ---- teardown tests (no GPU required) ----
+
+    #[test]
+    fn teardown_empties_handles() {
+        if !nvidiactl_present() {
+            return;
+        }
+        let mut be = NvidiaBackend::for_test();
+
+        // Open two fds
+        for _ in 0..2 {
+            let req = open_msg(DeviceKind::Ctl);
+            let mut resp = vec![0u8; 64];
+            be.dispatch(&req, &mut resp);
+        }
+        assert_eq!(be.handle_count(), 2);
+
+        be.teardown();
+        assert_eq!(be.handle_count(), 0);
+    }
+
+    #[test]
+    fn drop_closes_remaining_handles() {
+        if !nvidiactl_present() {
+            return;
+        }
+        // Open a handle, then drop the backend without calling teardown().
+        let mut be = NvidiaBackend::for_test();
+        let req = open_msg(DeviceKind::Ctl);
+        let mut resp = vec![0u8; 64];
+        be.dispatch(&req, &mut resp);
+        assert_eq!(be.handle_count(), 1);
+        drop(be); // must not panic; Drop closes the fd
+    }
+
+    // ---- GPU-present round-trip tests ----
+
+    #[test]
+    fn open_close_nvidiactl() {
+        if !nvidiactl_present() {
+            return;
+        }
+        let mut be = NvidiaBackend::for_test();
+
+        let req = open_msg(DeviceKind::Ctl);
+        let mut resp = vec![0u8; 64];
+        be.dispatch(&req, &mut resp);
+        let r = parse_resp(&resp);
+        assert_eq!(r.status, 0);
+
+        let h = opened_handle(&resp);
+        assert!(h > 0);
+
+        let req2 = close_msg(h);
+        let mut resp2 = vec![0u8; 32];
+        be.dispatch(&req2, &mut resp2);
+        assert_eq!(parse_resp(&resp2).status, 0);
+        assert_eq!(be.handle_count(), 0);
+    }
+
+    #[test]
+    fn check_version_str() {
+        if !nvidiactl_present() {
+            return;
+        }
+        let mut be = NvidiaBackend::for_test();
+
+        let oreq = open_msg(DeviceKind::Ctl);
+        let mut oresp = vec![0u8; 64];
+        be.dispatch(&oreq, &mut oresp);
+        let gh = opened_handle(&oresp);
+        assert!(gh > 0);
+
+        // nv_ioctl_rm_api_version_t: cmd(4) + reply(4) + versionString(64) = 72 bytes
+        let param_size: u32 = 72;
+        let mut ireq = hdr(MsgType::Ioctl, gh);
+        append(
+            &mut ireq,
+            &IoctlReq {
+                cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_CHECK_VERSION_STR, param_size) as u32,
+                data_len: param_size,
+                nested_offset: 0,
+                nested_len: 0,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        // First 4 bytes = cmd field.
+        let mut params = vec![0u8; param_size as usize];
+        params[0] = 0x32;
+        ireq.extend(params);
+
+        let mut iresp = vec![0u8; 512];
+        be.dispatch(&ireq, &mut iresp);
+        let r = parse_resp(&iresp);
+        assert!(
+            r.status == -0 || r.status == -Status::IoctlFailed.errno(),
+            "unexpected status {}",
+            r.status
+        );
+    }
+
+    /// NV_ESC_RM_MAP_MEMORY round-trip.
+    #[test]
+    fn map_memory_rejects_bad_fd_handle() {
+        let mut be = NvidiaBackend::for_test();
+
+        // We need an open nvidiactl fd as the "outer" fd for the ioctl.
+        if !nvidiactl_present() {
+            return;
+        }
+
+        // Open nvidiactl.
+        let oreq = open_msg(DeviceKind::Ctl);
+        let mut oresp = vec![0u8; 64];
+        be.dispatch(&oreq, &mut oresp);
+        let gh = opened_handle(&oresp);
+        assert!(gh > 0);
+
+        // Build a NV_ESC_RM_MAP_MEMORY ioctl with a bogus embedded FD handle.
+        let param_size: u32 = 56;
+        let mut ireq = hdr(MsgType::Ioctl, gh);
+        append(
+            &mut ireq,
+            &IoctlReq {
+                cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_MAP_MEMORY, param_size) as u32,
+                data_len: param_size,
+                nested_offset: 0,
+                nested_len: 0,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+
+        // 56 bytes of zeroed params — the embedded FD at offset 48 is 0, which is not a valid guest handle.
+        let mut params = vec![0u8; param_size as usize];
+        // Write a bogus FD handle (0xDEAD) at offset 48.
+        params[48..52].copy_from_slice(&0xDEADu32.to_le_bytes());
+        ireq.extend(params);
+
+        let mut iresp = vec![0u8; 512];
+        be.dispatch(&ireq, &mut iresp);
+        // Should fail with BadHandle since 0xDEAD is not in the handle table.
+        assert!(is_err(&iresp, Status::BadHandle));
+    }
+
+    #[test]
+    fn map_memory_translates_fd_and_forwards() {
+        if !nvidiactl_present() {
+            return;
+        }
+
+        let mut be = NvidiaBackend::for_test();
+
+        // Open nvidiactl — this is both the "outer" fd and the "map" fd.
+        let oreq = open_msg(DeviceKind::Ctl);
+        let mut oresp = vec![0u8; 64];
+        be.dispatch(&oreq, &mut oresp);
+        let ctl_handle = opened_handle(&oresp);
+
+        // Open a second nvidiactl fd to use as the embedded map FD.
+        let oreq2 = open_msg(DeviceKind::Ctl);
+        let mut oresp2 = vec![0u8; 64];
+        be.dispatch(&oreq2, &mut oresp2);
+        let map_handle = opened_handle(&oresp2);
+
+        // Build IoctlNVOS33ParametersWithFD with the map_handle as embedded FD.
+        let param_size: u32 = 56;
+        let mut ireq = hdr(MsgType::Ioctl, ctl_handle);
+        append(
+            &mut ireq,
+            &IoctlReq {
+                cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_MAP_MEMORY, param_size) as u32,
+                data_len: param_size,
+                nested_offset: 0,
+                nested_len: 0,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+
+        let mut params = vec![0u8; param_size as usize];
+        // Embedded FD at offset 48 = map_handle.
+        params[48..52].copy_from_slice(&(map_handle as u32).to_le_bytes());
+        ireq.extend(params);
+
+        let mut iresp = vec![0u8; 512];
+        be.dispatch(&ireq, &mut iresp);
+        let r = parse_resp(&iresp);
+
+        // The host ioctl will fail (we have no valid RM objects) but the dispatch path should reach the host ioctl — so we expect either IoctlFailed (host rejected it) or Ok (unlikely without valid handles).
+        assert_ne!(
+            r.status,
+            -Status::BadHandle.errno(),
+            "FD translation should have succeeded"
+        );
+    }
+
+    // ------------------------------------------------------------------ Real mapping round-trip Everything above stops at the host ioctl and expects it to fail, because building a mappable RM object takes a chain of allocations.
+
+    const NV01_ROOT_CLIENT: u32 = 0x41;
+    const NV01_DEVICE_0: u32 = 0x80;
+    const NV20_SUBDEVICE_0: u32 = 0x2080;
+    const TURING_USERMODE_A: u32 = 0xc461;
+
+    /// NVOS64_PARAMETERS field offsets.
+    const A_ROOT: usize = 0;
+    const A_PARENT: usize = 4;
+    const A_NEW: usize = 8;
+    const A_CLASS: usize = 12;
+    const A_PARAMS_SIZE: usize = 32;
+    const A_STATUS: usize = 40;
+    const ALLOC_OUTER: usize = 48;
+
+    // The real mapping tests place the host fd in their own reserved SHM window.
+    struct LocalWindow {
+        base: usize,
+        size: u64,
+    }
+    impl crate::shm::WindowPlacer for LocalWindow {
+        fn place(
+            &self,
+            offset: u64,
+            len: u64,
+            fd: RawFd,
+            fd_offset: u64,
+            writable: bool,
+        ) -> crate::error::Result<()> {
+            assert!(len > 0 && offset.checked_add(len).is_some_and(|end| end <= self.size));
+            let prot = libc::PROT_READ | if writable { libc::PROT_WRITE } else { 0 };
+            // SAFETY: the backend owns this reserved range until the test ends.
+            let mapped = unsafe {
+                libc::mmap(
+                    (self.base + offset as usize) as *mut _,
+                    len as usize,
+                    prot,
+                    libc::MAP_SHARED | libc::MAP_FIXED,
+                    fd,
+                    fd_offset as libc::off_t,
+                )
+            };
+            if mapped == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(())
+        }
+        fn withdraw(&self, _: u64, _: u64) -> crate::error::Result<()> {
+            // This in-process window aliases the allocator's own mapping; ShmAllocator::free restores that backing after this callback.
+            Ok(())
+        }
+    }
+
+    struct Chain {
+        be: NvidiaBackend,
+        ctl: u64,
+        gpu: u64,
+        cookie: u64,
+    }
+
+    impl Chain {
+        fn new() -> Self {
+            // Not for_test(): its write-combine zone is 16 KiB, and the smallest real mapping here is 64 KiB.
+            let mut be = NvidiaBackend::with_default_zones();
+            be.set_window(Box::new(LocalWindow {
+                base: be.shm.base_ptr() as usize,
+                size: be.shm.total_size(),
+            }));
+            let req = open_msg(DeviceKind::Ctl);
+            let mut resp = vec![0u8; 64];
+            be.dispatch(&req, &mut resp);
+            assert_eq!(parse_resp(&resp).status, 0, "open /dev/nvidiactl");
+            let ctl = opened_handle(&resp);
+            let mut c = Self {
+                be,
+                ctl,
+                gpu: 0,
+                cookie: 2,
+            };
+            // Select the host ABI before the allowlist sees an allocation.
+            c.simple(abi::ioctl::NV_ESC_CHECK_VERSION_STR, 72);
+            assert!(
+                c.be.rmallow.is_some(),
+                "the host release needs an RM allowlist"
+            );
+            // The driver always issues these two before allocating a client.
+            c.simple(abi::ioctl::NV_ESC_SYS_PARAMS, 8);
+            c.simple(abi::ioctl::NV_ESC_CARD_INFO, 2304);
+            // The driver opens /dev/nvidia0 and registers the control fd against it before allocating a device.
+            c.gpu = c.open_dev(DeviceKind::Gpu(0));
+            c.register_fd(c.gpu, c.ctl);
+            c
+        }
+
+        /// Open one of the character devices and return its guest handle.
+        fn open_dev(&mut self, kind: DeviceKind) -> u64 {
+            self.cookie += 1;
+            let req = open_msg(kind);
+            let mut resp = vec![0u8; 64];
+            self.be.dispatch(&req, &mut resp);
+            assert_eq!(parse_resp(&resp).status, 0, "open {kind:?}");
+            opened_handle(&resp)
+        }
+
+        /// NV_ESC_REGISTER_FD: attach `fd_handle` to the device `on`.
+        fn register_fd(&mut self, on: u64, fd_handle: u64) {
+            self.cookie += 1;
+            let mut req = hdr(MsgType::Ioctl, on);
+            append(
+                &mut req,
+                &IoctlReq {
+                    cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_REGISTER_FD, 4) as u32,
+                    data_len: 4,
+                    nested_offset: 0,
+                    nested_len: 0,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
+                },
+            );
+            req.extend_from_slice(&(fd_handle as u32).to_le_bytes());
+            let mut resp = vec![0u8; 256];
+            self.be.dispatch(&req, &mut resp);
+        }
+
+        /// Issue a parameterless escape whose payload is just a zeroed buffer.
+        fn simple(&mut self, escape: u32, size: u32) {
+            self.cookie += 1;
+            let mut req = hdr(MsgType::Ioctl, self.ctl);
+            append(
+                &mut req,
+                &IoctlReq {
+                    cmd: abi::ioctl::_IOWR(escape, size) as u32,
+                    data_len: size,
+                    nested_offset: 0,
+                    nested_len: 0,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
+                },
+            );
+            req.extend_from_slice(&vec![0u8; size as usize]);
+            let mut resp = vec![0u8; size as usize + 256];
+            self.be.dispatch(&req, &mut resp);
+        }
+
+        /// Issue an RM_ALLOC and return the handle RM assigned.
+        fn alloc(&mut self, root: u32, parent: u32, class: u32, params: &[u8]) -> u32 {
+            let declared = params.len() as u32;
+            self.alloc_with(root, parent, class, params, declared)
+        }
+
+        /// Same, but with an explicit `paramsSize` field.
+        fn alloc_with(
+            &mut self,
+            root: u32,
+            parent: u32,
+            class: u32,
+            params: &[u8],
+            declared: u32,
+        ) -> u32 {
+            let mut outer = vec![0u8; ALLOC_OUTER];
+            outer[A_ROOT..A_ROOT + 4].copy_from_slice(&root.to_le_bytes());
+            outer[A_PARENT..A_PARENT + 4].copy_from_slice(&parent.to_le_bytes());
+            outer[A_CLASS..A_CLASS + 4].copy_from_slice(&class.to_le_bytes());
+            outer[A_PARAMS_SIZE..A_PARAMS_SIZE + 4].copy_from_slice(&declared.to_le_bytes());
+
+            self.cookie += 1;
+            let mut req = hdr(MsgType::Ioctl, self.ctl);
+            append(
+                &mut req,
+                &IoctlReq {
+                    cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_ALLOC, ALLOC_OUTER as u32) as u32,
+                    data_len: ALLOC_OUTER as u32,
+                    // The class parameters follow the top-level struct, which is where the driver puts them.
+                    nested_offset: ALLOC_OUTER as u32,
+                    nested_len: params.len() as u32,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
+                },
+            );
+            req.extend_from_slice(&outer);
+            req.extend_from_slice(params);
+
+            let mut resp = vec![0u8; 4096];
+            let n = self.be.dispatch(&req, &mut resp);
+            assert!(n > 0, "alloc class {class:#x}: empty response");
+            assert_eq!(
+                parse_resp(&resp).status,
+                0,
+                "alloc class {class:#x}: transport status"
+            );
+            let body = IOCTL_BODY;
+            let out = &resp[body..body + ALLOC_OUTER];
+            let status = u32::from_le_bytes(out[A_STATUS..A_STATUS + 4].try_into().unwrap());
+            assert_eq!(status, 0, "alloc class {class:#x}: RM status {status:#x}");
+            u32::from_le_bytes(out[A_NEW..A_NEW + 4].try_into().unwrap())
+        }
+
+        /// Build the object chain and return (hClient, hSubdevice, hMemory).
+        fn usermode_object(&mut self) -> (u32, u32, u32) {
+            let client = self.alloc(0, 0, NV01_ROOT_CLIENT, &[]);
+            assert_ne!(client, 0, "RM assigned no client handle");
+
+            let mut dev_params = vec![0u8; 56];
+            dev_params[4..8].copy_from_slice(&client.to_le_bytes());
+            let device = self.alloc(client, client, NV01_DEVICE_0, &dev_params);
+
+            // NV2080_ALLOC_PARAMETERS is a single subDeviceID.
+            let subdevice = self.alloc(client, device, NV20_SUBDEVICE_0, &0u32.to_le_bytes());
+
+            let memory = self.alloc(client, subdevice, TURING_USERMODE_A, &[]);
+            (client, subdevice, memory)
+        }
+
+        /// A dedicated fd to carry the mapping.
+        fn map_fd(&mut self) -> u64 {
+            let h = self.open_dev(DeviceKind::Gpu(0));
+            self.register_fd(h, self.ctl);
+            h
+        }
+
+        /// NV_ESC_RM_MAP_MEMORY.
+        fn map(&mut self, client: u32, dev: u32, mem: u32, len: u64, fd: u64) -> (u64, u64, u64) {
+            let mut p = vec![0u8; 56];
+            p[0..4].copy_from_slice(&client.to_le_bytes());
+            p[4..8].copy_from_slice(&dev.to_le_bytes());
+            p[8..12].copy_from_slice(&mem.to_le_bytes());
+            p[24..32].copy_from_slice(&len.to_le_bytes());
+            // The flags the driver sends for this mapping.
+            p[44..48].copy_from_slice(&0x0308_0002u32.to_le_bytes());
+            p[48..52].copy_from_slice(&(fd as u32).to_le_bytes());
+
+            self.cookie += 1;
+            let mut req = hdr(MsgType::Ioctl, self.ctl);
+            append(
+                &mut req,
+                &IoctlReq {
+                    cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_MAP_MEMORY, 56) as u32,
+                    data_len: 56,
+                    nested_offset: 0,
+                    nested_len: 0,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
+                },
+            );
+            req.extend_from_slice(&p);
+
+            let mut resp = vec![0u8; 4096];
+            self.be.dispatch(&req, &mut resp);
+            let rh = parse_resp(&resp);
+            assert_eq!(rh.status, 0,);
+            let body = IOCTL_BODY;
+            let out = &resp[body..body + 56];
+            let rm = u32::from_le_bytes(out[40..44].try_into().unwrap());
+            assert_eq!(rm, 0, "map: RM status {rm:#x}");
+            // The SHM offset comes back in pLinearAddress, not in a reply struct: the guest quotes it in a separate Mmap message, and that is where placement and caching are decided.
+            let linear = u64::from_le_bytes(out[32..40].try_into().unwrap());
+            (linear, len, linear)
+        }
+
+        /// Close a device handle, as a guest does when its fd goes away.
+        fn close_dev(&mut self, handle: u64) {
+            self.cookie += 1;
+            let req = close_msg(handle);
+            let mut resp = vec![0u8; 128];
+            self.be.dispatch(&req, &mut resp);
+            assert_eq!(parse_resp(&resp).status, 0, "close handle {handle}");
+        }
+
+        /// NV_ESC_RM_FREE of one object.
+        fn free_obj(&mut self, root: u32, parent: u32, object: u32) {
+            let mut p = vec![0u8; 16];
+            p[0..4].copy_from_slice(&root.to_le_bytes());
+            p[4..8].copy_from_slice(&parent.to_le_bytes());
+            p[8..12].copy_from_slice(&object.to_le_bytes());
+            self.cookie += 1;
+            let mut req = hdr(MsgType::Ioctl, self.ctl);
+            append(
+                &mut req,
+                &IoctlReq {
+                    cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_FREE, 16) as u32,
+                    data_len: 16,
+                    nested_offset: 0,
+                    nested_len: 0,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
+                },
+            );
+            req.extend_from_slice(&p);
+            let mut resp = vec![0u8; 512];
+            self.be.dispatch(&req, &mut resp);
+            let rh = parse_resp(&resp);
+            assert_eq!(rh.status, 0, "free: transport status, ",);
+            let body = IOCTL_BODY;
+            let rm = u32::from_le_bytes(resp[body + 12..body + 16].try_into().unwrap());
+            assert_eq!(rm, 0, "free of {object:#x}: RM status {rm:#x}");
+        }
+
+        /// NV_ESC_RM_UNMAP_MEMORY, keyed by the pLinearAddress the map returned.
+        fn unmap(&mut self, client: u32, dev: u32, mem: u32, linear: u64) {
+            let mut p = vec![0u8; 32];
+            p[0..4].copy_from_slice(&client.to_le_bytes());
+            p[4..8].copy_from_slice(&dev.to_le_bytes());
+            p[8..12].copy_from_slice(&mem.to_le_bytes());
+            p[16..24].copy_from_slice(&linear.to_le_bytes());
+
+            self.cookie += 1;
+            let mut req = hdr(MsgType::Ioctl, self.ctl);
+            append(
+                &mut req,
+                &IoctlReq {
+                    cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_UNMAP_MEMORY, 32) as u32,
+                    data_len: 32,
+                    nested_offset: 0,
+                    nested_len: 0,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
+                },
+            );
+            req.extend_from_slice(&p);
+            let mut resp = vec![0u8; 4096];
+            self.be.dispatch(&req, &mut resp);
+            let rh = parse_resp(&resp);
+            assert_eq!(rh.status, 0,);
+            let body = IOCTL_BODY;
+            let rm = u32::from_le_bytes(resp[body + 24..body + 28].try_into().unwrap());
+            assert_eq!(rm, 0, "unmap: RM status {rm:#x}");
+        }
+    }
+
+    #[test]
+    fn maps_turing_usermode_aperture_for_real() {
+        if !nvidiactl_present() {
+            return;
+        }
+        let mut c = Chain::new();
+        let (client, sub, mem) = c.usermode_object();
+        let fd = c.map_fd();
+
+        let (off, len, linear) = c.map(client, sub, mem, 65536, fd);
+        assert_eq!(len, 65536, "mapped length");
+        assert_ne!(linear, 0, "pLinearAddress should be the SHM offset");
+        assert_eq!(
+            linear, off,
+            "pLinearAddress must be the SHM offset the guest sees"
+        );
+
+        // The SHM window now aliases GPU registers.
+        let base = c.be.shm_base_ptr();
+        assert!(!base.is_null(), "SHM base");
+        let first = unsafe { std::ptr::read_volatile(base.add(off as usize) as *const u32) };
+        eprintln!("TURING_USERMODE_A first dword through SHM: {first:#010x}");
+
+        c.unmap(client, sub, mem, linear);
+        c.be.teardown();
+    }
+
+    /// Closing a device fd must release whatever it was mapping.
+    #[test]
+    fn closing_the_fd_releases_its_mapping_without_any_unmap() {
+        if !nvidiactl_present() {
+            return;
+        }
+        let mut c = Chain::new();
+        let (client, sub, first) = c.usermode_object();
+        c.free_obj(client, sub, first);
+
+        let before = c.be.shm_free_bytes();
+        for i in 0..50 {
+            let mem = c.alloc(client, sub, TURING_USERMODE_A, &[]);
+            let fd = c.map_fd();
+            let (off, _len, _linear) = c.map(client, sub, mem, 65536, fd);
+            assert_ne!(off, 0, "run {i}: no SHM offset");
+
+            // Exit the way CUDA does: free the object and drop the fd, with no unmap anywhere.
+            c.free_obj(client, sub, mem);
+            c.close_dev(fd);
+
+            assert_eq!(
+                before,
+                c.be.shm_free_bytes(),
+                "run {i}: closing the fd did not release its mapping"
+            );
+        }
+        c.be.teardown();
+    }
+
+    /// A hundred map/unmap cycles against the real aperture, asserting the SHM zones end exactly as full as they started. **A file descriptor that has carried a mapping cannot carry another.** Reusing one gives NV_ERR_STATE_IN_USE (0x63) on the second NV_ESC_RM_MAP_MEMORY even though the preceding NV_ESC_RM_UNMAP_MEMORY and NV_ESC_RM_FREE both returned NV_OK.
+    #[test]
+    fn repeated_map_unmap_does_not_exhaust_the_zone() {
+        if !nvidiactl_present() {
+            return;
+        }
+        let mut c = Chain::new();
+        let (client, sub, first) = c.usermode_object();
+        // The usermode aperture allows one live mapping, so the object built during setup has to go before the loop makes its own.
+        c.free_obj(client, sub, first);
+
+        // TURING_USERMODE_A permits one mapping per object -- a second map of a still-mapped object is refused with NV_ERR_STATE_IN_USE -- so each cycle allocates its own.
+        let before = c.be.shm_free_bytes();
+        let handles_before = c.be.handle_count();
+        let cycles = 100;
+        for i in 0..cycles {
+            let mem = c.alloc(client, sub, TURING_USERMODE_A, &[]);
+            let fd = c.map_fd();
+            eprintln!("cycle {i}: mem={mem:#x} fd={fd}");
+            let (off, _len, linear) = c.map(client, sub, mem, 65536, fd);
+            assert_ne!(off, 0, "iteration {i}: no SHM offset");
+            c.unmap(client, sub, mem, linear);
+            c.free_obj(client, sub, mem);
+            c.close_dev(fd);
+        }
+        let after = c.be.shm_free_bytes();
+        assert_eq!(
+            before, after,
+            "{cycles} map/unmap cycles did not return every byte to the zones"
+        );
+        assert_eq!(
+            handles_before,
+            c.be.handle_count(),
+            "{cycles} cycles leaked host file descriptors"
+        );
+        c.be.teardown();
+    }
+
+    // ================================================================== Memory named by a CPU address ==================================================================
+
+    /// An address from a guest is an address in the guest's process.
+    fn osdesc() -> abi::osdesc::OsDesc {
+        abi::osdesc::select(abi::version::DriverVersion::new(615, 71, 9))
+            .expect("615.71.09 has a table")
+    }
+
+    /// `NV_ESC_RM_ALLOC` of the class, with the address in the nested block.
+    #[test]
+    fn registering_memory_by_address_through_rm_alloc_is_refused() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        be.set_caps(crate::caps::Caps::parse("graphics,compute,video,utility").unwrap());
+        let d = osdesc();
+
+        let mut params = vec![0u8; d.alloc.params_size];
+        params[d.alloc.address_at..d.alloc.address_at + 8]
+            .copy_from_slice(&0x7fff_0000_0000u64.to_le_bytes());
+        params[d.alloc.limit_at..d.alloc.limit_at + 8]
+            .copy_from_slice(&(0x200000u64 - 1).to_le_bytes());
+
+        let resp = send_nested_bytes(
+            &mut be,
+            h,
+            abi::ioctl::NV_ESC_RM_ALLOC,
+            &rm_alloc(d.class),
+            &params,
+        );
+        assert_eq!(parse_resp(&resp).status, 0, "the ioctl itself succeeds");
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        assert_eq!(
+            u32::from_le_bytes(resp[body + 40..body + 44].try_into().unwrap()),
+            0x56,
+            "NV_ERR_NOT_SUPPORTED in NVOS64.status"
+        );
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.calls());
+    }
+
+    /// The older escape, which carries its class inside the parameters.
+    #[test]
+    fn registering_memory_by_address_through_rm_alloc_memory_is_refused() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let d = osdesc();
+
+        // The wire struct is `nv_ioctl_nvos02_parameters_with_fd`, which is NVOS02_PARAMETERS followed by the descriptor the allocation may be made on, so it is longer than the parameters alone and the ABI check refuses anything else.
+        let want = abi::versions::table_for(abi::version::DriverVersion::new(615, 71, 9))
+            .and_then(|t| abi::versions::lookup(t, abi::ioctl::NV_ESC_RM_ALLOC_MEMORY))
+            .and_then(|e| e.param_size)
+            .expect("the escape has a size in the 615.71.09 profile") as usize;
+        assert!(want >= d.alloc_memory.params_size);
+        let mut p = vec![0u8; want];
+        let at = d.alloc_memory_class_at;
+        p[at..at + 4].copy_from_slice(&d.class.to_le_bytes());
+        p[d.alloc_memory.address_at..d.alloc_memory.address_at + 8]
+            .copy_from_slice(&0xdead_0000u64.to_le_bytes());
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg(h, abi::ioctl::NV_ESC_RM_ALLOC_MEMORY, &p),
+            &mut resp,
+        );
+        assert_eq!(parse_resp(&resp).status, 0);
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let st = d.alloc_memory_status_at;
+        assert_eq!(
+            u32::from_le_bytes(resp[body + st..body + st + 4].try_into().unwrap()),
+            0x56
+        );
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.calls());
+    }
+
+    /// The heap ioctl is a union: only one of its functions names an address, and the function has to be read before anything else in the block means what it looks like.
+    #[test]
+    fn registering_memory_by_address_through_the_heap_ioctl_is_refused() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let d = osdesc();
+
+        let mut p = vec![0u8; d.vid_heap.params_size];
+        let f = d.vid_heap_function_at;
+        p[f..f + 4].copy_from_slice(&d.vid_heap_function.to_le_bytes());
+        p[d.vid_heap.address_at..d.vid_heap.address_at + 8]
+            .copy_from_slice(&0x4000_0000u64.to_le_bytes());
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg(h, abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL, &p),
+            &mut resp,
+        );
+        assert_eq!(parse_resp(&resp).status, 0);
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let st = d.vid_heap_status_at;
+        assert_eq!(
+            u32::from_le_bytes(resp[body + st..body + st + 4].try_into().unwrap()),
+            0x56
+        );
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.calls());
+    }
+
+    // ------------------------------------------------------------------ ...and translated, once the guest says where its pages are. ------------------------------------------------------------------
+
+    const TPAGE: u64 = 4096;
+
+    /// A host that answers a registration, and reads back what it was given.
+    #[derive(Clone)]
+    struct RegisteringHost {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+        /// What the pages behind the address read back as, one byte per page.
+        seen: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        address_at: usize,
+        status_at: usize,
+        hmemory_at: usize,
+        pages: u64,
+        handle: u32,
+    }
+
+    impl RegisteringHost {
+        fn new(address_at: usize, status_at: usize, hmemory_at: usize, pages: u64) -> Self {
+            Self {
+                calls: Default::default(),
+                seen: Default::default(),
+                address_at,
+                status_at,
+                hmemory_at,
+                pages,
+                handle: 0xcafe_0001,
+            }
+        }
+        fn calls(&self) -> Vec<u64> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn seen(&self) -> Vec<u8> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl HostDriver for RegisteringHost {
+        fn ioctl(&self, _fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            self.calls.lock().unwrap().push(request);
+            // NVOS00: hRoot, hObjectParent, hObjectOld, status.
+            if request & 0xFF == 0x29 {
+                arg[12..16].copy_from_slice(&0u32.to_le_bytes());
+                return Ok(());
+            }
+            let a = u64::from_le_bytes(
+                arg[self.address_at..self.address_at + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            let mut seen = Vec::new();
+            for i in 0..self.pages {
+                // SAFETY: this is exactly what RM does with the address, and the span is mapped read-write for every byte of the length that came with it.
+                seen.push(unsafe { *((a + i * TPAGE) as *const u8) });
+            }
+            *self.seen.lock().unwrap() = seen;
+            arg[self.hmemory_at..self.hmemory_at + 4].copy_from_slice(&self.handle.to_le_bytes());
+            arg[self.status_at..self.status_at + 4].copy_from_slice(&0u32.to_le_bytes());
+            Ok(())
+        }
+    }
+
+    fn backend_for_registration(host: &RegisteringHost) -> (NvidiaBackend, u64) {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(abi::version::DriverVersion::new(615, 71, 9))
+            .expect("615.71.09 has tables");
+        be.set_host(Box::new(host.clone()));
+        let ram =
+            crate::guestmem::fake::FakeRam::new(&[(0, 16 * TPAGE), (1024 * TPAGE, 16 * TPAGE)]);
+        ram.fill();
+        be.set_guest_ram(Box::new(ram));
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let h = be.handles.insert(OwnedFd::from(null));
+        // The free path only reads what happened on a control file, and that is where every registration is made.
+        be.handle_kinds.insert(h, DeviceKind::Ctl);
+        (be, h)
+    }
+
+    /// An ioctl with a page-run table beside it, the way the guest driver sends one.
+    fn ioctl_msg_with_runs(
+        handle: u64,
+        escape: u32,
+        params: &[u8],
+        runs: &[(u64, u64)],
+    ) -> Vec<u8> {
+        let runs: Vec<protocol::pageruns::Run> = runs
+            .iter()
+            .map(|&(gpa, len)| protocol::pageruns::Run { gpa, len })
+            .collect();
+        let mut table = vec![0u8; protocol::pageruns::encoded_len(runs.len())];
+        let n = protocol::pageruns::encode(&mut table, &runs).expect("the table fits");
+        table.truncate(n);
+
+        let mut v = hdr(MsgType::Ioctl, handle);
+        append(
+            &mut v,
+            &IoctlReq {
+                cmd: abi::ioctl::_IOWR(escape, params.len() as u32) as u32,
+                data_len: params.len() as u32,
+                nested_offset: 0,
+                nested_len: 0,
+                deep_ptr_offset: protocol::pageruns::PAGE_RUNS,
+                deep_len: table.len() as u32,
+            },
+        );
+        v.extend_from_slice(params);
+        v.extend_from_slice(&table);
+        v
+    }
+
+    /// NVOS00: hRoot, hObjectParent, hObjectOld, status.
+    fn free_params(client: u32, object: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 16];
+        p[0..4].copy_from_slice(&client.to_le_bytes());
+        p[8..12].copy_from_slice(&object.to_le_bytes());
+        p
+    }
+
+    /// A heap registration whose pages the guest named: two pages from two different regions of guest RAM, with a hole between them.
+    fn heap_registration(d: &abi::osdesc::OsDesc, client: u32) -> Vec<u8> {
+        let mut p = vec![0u8; d.vid_heap.params_size];
+        p[0..4].copy_from_slice(&client.to_le_bytes());
+        let f = d.vid_heap_function_at;
+        p[f..f + 4].copy_from_slice(&d.vid_heap_function.to_le_bytes());
+        // The guest's own address, which means nothing in this process.
+        p[d.vid_heap.address_at..d.vid_heap.address_at + 8]
+            .copy_from_slice(&0x7fff_0000_0000u64.to_le_bytes());
+        p[d.vid_heap.limit_at..d.vid_heap.limit_at + 8]
+            .copy_from_slice(&(2 * TPAGE - 1).to_le_bytes());
+        p
+    }
+
+    /// The property the whole of M6 exists for: RM is handed an address that reads back the guest's own pages, and never the guest's number.
+    #[test]
+    fn a_registration_reaches_the_host_as_the_guest_s_own_pages() {
+        let d = osdesc();
+        let host = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, h) = backend_for_registration(&host);
+
+        let p = heap_registration(&d, 0xc1d0_0001);
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &p,
+                &[(1024 * TPAGE, TPAGE), (0, TPAGE)],
+            ),
+            &mut resp,
+        );
+
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(host.calls().len(), 1, "the host was asked once");
+        assert_eq!(
+            host.seen(),
+            vec![
+                crate::guestmem::fake::mark(1024 * TPAGE),
+                crate::guestmem::fake::mark(0)
+            ],
+            "the host read the guest's pages, in the order the guest asked for"
+        );
+        assert_eq!(
+            be.registration_count(),
+            1,
+            "the span is held for the object"
+        );
+        be.teardown();
+    }
+
+    /// And the span goes when RM's object does.
+    #[test]
+    fn a_registration_is_released_when_its_object_is_freed() {
+        let d = osdesc();
+        let host = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, h) = backend_for_registration(&host);
+        let client = 0xc1d0_0001u32;
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &heap_registration(&d, client),
+                &[(0, TPAGE), (TPAGE, TPAGE)],
+            ),
+            &mut resp,
+        );
+        assert_eq!(be.registration_count(), 1);
+
+        be.dispatch(
+            &ioctl_msg(h, 0x29, &free_params(client, host.handle)),
+            &mut resp,
+        );
+
+        assert_eq!(
+            be.registration_count(),
+            0,
+            "freeing the object released the guest memory it held"
+        );
+        be.teardown();
+    }
+
+    /// And on close, which is what catches one freed as some parent's child.
+    #[test]
+    fn a_registration_is_released_when_the_file_closes() {
+        let d = osdesc();
+        let host = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, h) = backend_for_registration(&host);
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &heap_registration(&d, 0xc1d0_0001),
+                &[(0, 2 * TPAGE)],
+            ),
+            &mut resp,
+        );
+        assert_eq!(be.registration_count(), 1);
+
+        be.dispatch(&hdr(MsgType::Close, h), &mut resp);
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(be.registration_count(), 0, "close released it");
+        be.teardown();
+    }
+
+    /// The refusal is still there for a guest that sends no runs.
+    #[test]
+    fn a_registration_without_page_runs_is_still_refused() {
+        let d = osdesc();
+        let host = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, h) = backend_for_registration(&host);
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &heap_registration(&d, 0xc1d0_0001),
+            ),
+            &mut resp,
+        );
+
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let st = d.vid_heap_status_at;
+        assert_eq!(
+            u32::from_le_bytes(resp[body + st..body + st + 4].try_into().unwrap()),
+            0x56,
+            "NV_ERR_NOT_SUPPORTED"
+        );
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.calls());
+        assert_eq!(be.registration_count(), 0);
+        be.teardown();
+    }
+
+    /// A descriptor that is not a user virtual address is refused, however well-formed the runs beside it are.
+    #[test]
+    fn a_descriptor_that_is_not_a_user_address_is_refused() {
+        let d = osdesc();
+        let host = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, h) = backend_for_registration(&host);
+
+        let mut refused = Vec::new();
+        for t in 0u32..8 {
+            let mut p = heap_registration(&d, 0xc1d0_0001);
+            let at = d.vid_heap.type_at;
+            p[at..at + 4].copy_from_slice(&t.to_le_bytes());
+
+            let before = host.calls().len();
+            let mut resp = vec![0u8; 4096];
+            be.dispatch(
+                &ioctl_msg_with_runs(
+                    h,
+                    abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                    &p,
+                    &[(0, TPAGE), (TPAGE, TPAGE)],
+                ),
+                &mut resp,
+            );
+            if host.calls().len() == before {
+                refused.push(t);
+            } else {
+                be.dispatch(
+                    &ioctl_msg(h, 0x29, &free_params(0xc1d0_0001, host.handle)),
+                    &mut resp,
+                );
+            }
+        }
+
+        let served: Vec<u32> = (0..8).filter(|t| !refused.contains(t)).collect();
+        assert_eq!(
+            served,
+            vec![d.virtual_address],
+            "only a user virtual address may be translated; every other descriptor type \
+             names something in this process"
+        );
+        be.teardown();
+    }
+
+    /// The registration and the free need not arrive on the same file.
+    #[test]
+    fn a_registration_is_released_by_a_free_on_another_file() {
+        let d = osdesc();
+        let host = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, gpu) = backend_for_registration(&host);
+        let client = 0xc1d0_0001u32;
+        // A second file, as a guest that opened both nodes has.
+        let ctl = be.handles.insert(OwnedFd::from(
+            std::fs::File::open("/dev/null").expect("/dev/null"),
+        ));
+        be.handle_kinds.insert(ctl, DeviceKind::Ctl);
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                gpu,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                &heap_registration(&d, client),
+                &[(0, TPAGE), (TPAGE, TPAGE)],
+            ),
+            &mut resp,
+        );
+        assert_eq!(be.registration_count(), 1);
+
+        be.dispatch(
+            &ioctl_msg(ctl, 0x29, &free_params(client, host.handle)),
+            &mut resp,
+        );
+        assert_eq!(
+            be.registration_count(),
+            0,
+            "a free on the control file released what the GPU file registered"
+        );
+        be.teardown();
+    }
+
+    /// Runs that do not add up to the length asked for are refused rather than mapped short: RM would pin two pages and find one.
+    #[test]
+    fn runs_that_do_not_cover_the_length_are_refused() {
+        let d = osdesc();
+        let host = RegisteringHost::new(
+            d.vid_heap.address_at,
+            d.vid_heap_status_at,
+            d.vid_heap_hmemory_at,
+            2,
+        );
+        let (mut be, h) = backend_for_registration(&host);
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg_with_runs(
+                h,
+                abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL,
+                // Two pages asked for, one page described.
+                &heap_registration(&d, 0xc1d0_0001),
+                &[(0, TPAGE)],
+            ),
+            &mut resp,
+        );
+
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let st = d.vid_heap_status_at;
+        assert_eq!(
+            u32::from_le_bytes(resp[body + st..body + st + 4].try_into().unwrap()),
+            0x56
+        );
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.calls());
+        be.teardown();
+    }
+
+    /// The other side of it.
+    #[test]
+    fn an_ordinary_heap_call_still_reaches_the_host() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let d = osdesc();
+
+        let mut p = vec![0u8; d.vid_heap.params_size];
+        let f = d.vid_heap_function_at;
+        // NVOS32_FUNCTION_ALLOC_SIZE.
+        p[f..f + 4].copy_from_slice(&2u32.to_le_bytes());
+        // And an address pattern where the registration route keeps its own, to show the function is what decides and not the bytes.
+        p[d.vid_heap.address_at..d.vid_heap.address_at + 8]
+            .copy_from_slice(&0x4000_0000u64.to_le_bytes());
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(
+            &ioctl_msg(h, abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL, &p),
+            &mut resp,
+        );
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(host.calls().len(), 1, "host heard {:x?}", host.calls());
+    }
+
+    /// The discriminator is exactly one function wide, and stays that way.
+    #[test]
+    fn exactly_one_heap_function_is_the_one_that_names_an_address() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        let d = osdesc();
+        let f = d.vid_heap_function_at;
+
+        let mut refused = Vec::new();
+        for func in 0u32..64 {
+            let mut p = vec![0u8; d.vid_heap.params_size];
+            p[f..f + 4].copy_from_slice(&func.to_le_bytes());
+            // An address in every one of them, so what decides is the function and never the bytes that happen to sit at the address offset.
+            p[d.vid_heap.address_at..d.vid_heap.address_at + 8]
+                .copy_from_slice(&0x4000_0000u64.to_le_bytes());
+
+            let before = host.calls().len();
+            let mut resp = vec![0u8; 4096];
+            be.dispatch(
+                &ioctl_msg(h, abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL, &p),
+                &mut resp,
+            );
+            assert_eq!(parse_resp(&resp).status, 0, "function {func}");
+            if host.calls().len() == before {
+                refused.push(func);
+            }
+        }
+
+        assert_eq!(
+            refused,
+            vec![d.vid_heap_function],
+            "only NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR ({}) may be refused here",
+            d.vid_heap_function
+        );
+    }
+
+    /// And an allocation of some other class is untouched by any of this.
+    #[test]
+    fn an_allocation_of_another_class_is_not_mistaken_for_a_registration() {
+        let host = CountingHost::default();
+        let (mut be, h) = backend_on(&host);
+        be.set_caps(crate::caps::Caps::parse("graphics,video").unwrap());
+        send_alloc(&mut be, h, 0xc7b7, 12);
+        assert_eq!(host.calls().len(), 1, "host heard {:x?}", host.calls());
+    }
+
+    /// What the guest is told about registration by address.
+    #[test]
+    fn the_guest_is_told_where_each_route_keeps_its_address() {
+        let host = CountingHost::default();
+        let (be, _h) = backend_on(&host);
+        let d = osdesc();
+        let mut buf = vec![0u8; 1024];
+        let n = be.write_osdesc_section(&mut buf);
+        assert_eq!(n, 22 * 4, "the section is a fixed set of words");
+
+        let word = |i: usize| u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(word(0), NvidiaBackend::OSDESC_MAGIC);
+        assert_eq!(word(1), d.class);
+        assert_eq!(word(2), d.vid_heap_function);
+        assert_eq!(word(3), d.vid_heap_function_at as u32);
+        assert_eq!(word(4), d.alloc_memory_class_at as u32);
+        assert_eq!(word(5), d.virtual_address);
+        assert_eq!(word(6), d.alloc_memory_status_at as u32);
+        assert_eq!(word(7), d.vid_heap_status_at as u32);
+        assert_eq!(word(8), d.vid_heap_hmemory_at as u32);
+
+        for (i, r) in [d.alloc, d.alloc_memory, d.vid_heap].iter().enumerate() {
+            let at = 10 + i * 4;
+            assert_eq!(word(at), r.params_size as u32, "route {i} size");
+            assert_eq!(word(at + 1), r.address_at as u32, "route {i} address");
+            assert_eq!(word(at + 2), r.limit_at as u32, "route {i} limit");
+            assert_eq!(word(at + 3), r.type_at as u32, "route {i} type");
+            // Whatever the release says, the address has to be inside the block, or the guest reads past what its own caller sent.
+            assert!(r.address_at + 8 <= r.params_size, "route {i}");
+        }
+    }
+
+    /// With no release there is nothing to say, and a guest told nothing sends no pages -- which is refused, the same answer as before any of this.
+    #[test]
+    fn a_backend_with_no_release_describes_no_route() {
+        let be = NvidiaBackend::for_test();
+        let mut buf = vec![0u8; 1024];
+        assert_eq!(be.write_osdesc_section(&mut buf), 0);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    // ================================================================== UVM ==================================================================
+
+    /// A fake UVM: records every call with the bytes it was given, and answers `UVM_PAGEABLE_MEM_ACCESS` with whatever the test set.
+    type UvmLog = std::sync::Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>>;
+
+    #[derive(Clone)]
+    struct UvmHost {
+        calls: UvmLog,
+        pageable: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    }
+
+    impl Default for UvmHost {
+        fn default() -> Self {
+            Self {
+                calls: Default::default(),
+                pageable: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            }
+        }
+    }
+
+    impl HostDriver for UvmHost {
+        fn ioctl(&self, _fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+            self.calls.lock().unwrap().push((request, arg.to_vec()));
+            if request == 0x27 && arg.len() >= 8 {
+                arg[0] = self.pageable.load(std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
+
+    impl UvmHost {
+        fn calls(&self) -> Vec<(u64, Vec<u8>)> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn nums(&self) -> Vec<u64> {
+            self.calls().into_iter().map(|(n, _)| n).collect()
+        }
+        /// The four bytes at `at` of the last block the host was given.
+        fn last_param(&self, at: usize) -> u32 {
+            let calls = self.calls();
+            let (_, p) = calls.last().expect("the host was called");
+            u32::from_le_bytes(p[at..at + 4].try_into().unwrap())
+        }
+        /// The VA space reports pageable access on, as it would on a host with HMM or ATS available and a release with no flag to refuse it.
+        fn pageable_is_on(&self) {
+            self.pageable.store(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A backend on `v` with a UVM file and a control file already open, and the handle of each.
+    fn uvm_backend(host: &UvmHost, v: abi::version::DriverVersion) -> (NvidiaBackend, u64, u64) {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_driver_version(v)
+            .unwrap_or_else(|e| panic!("{v}: {e}"));
+        be.set_host(Box::new(host.clone()));
+        let mut open = |kind| {
+            let null = std::fs::File::open("/dev/null").expect("/dev/null");
+            let h = be.handles.insert(OwnedFd::from(null));
+            be.handle_kinds.insert(h, kind);
+            h
+        };
+        let uvm = open(DeviceKind::Uvm);
+        let ctl = open(DeviceKind::Ctl);
+        (be, uvm, ctl)
+    }
+
+    /// A UVM message.
+    fn uvm_msg(handle: u64, num: u64, params: &[u8]) -> Vec<u8> {
+        let mut v = hdr(MsgType::Ioctl, handle);
+        append(
+            &mut v,
+            &IoctlReq {
+                cmd: num as u32,
+                data_len: params.len() as u32,
+                nested_offset: 0,
+                nested_len: 0,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        v.extend_from_slice(params);
+        v
+    }
+
+    fn send_uvm(be: &mut NvidiaBackend, h: u64, num: u64, params: &[u8]) -> Vec<u8> {
+        let mut resp = vec![0u8; 64 * 1024];
+        be.dispatch(&uvm_msg(h, num, params), &mut resp);
+        resp
+    }
+
+    const UVM_RESERVE_VA: u64 = 0x01;
+    const UVM_REGISTER_GPU: u64 = 0x25;
+    const UVM_PAGEABLE_MEM_ACCESS: u64 = 0x27;
+    const UVM_IMPORT_DMA_BUF: u64 = 0x53;
+    const UVM_INITIALIZE: u64 = 0x3000_0001;
+    /// `rmCtrlFd` and `hClient` in `UVM_REGISTER_GPU_PARAMS`.
+    const REGISTER_GPU_FD: usize = 24;
+
+    fn v615() -> abi::version::DriverVersion {
+        abi::version::DriverVersion::new(615, 71, 9)
+    }
+
+    #[test]
+    fn a_uvm_command_the_release_defines_reaches_the_host() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        let resp = send_uvm(&mut be, uvm, UVM_RESERVE_VA, &[0u8; 24]);
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(host.nums(), vec![UVM_RESERVE_VA]);
+    }
+
+    /// The table is the whole check UVM gets: it has no flags word, so nothing says who may call what, only what each call is.
+    #[test]
+    fn a_uvm_command_the_release_does_not_define_never_reaches_the_host() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        // 0x08 sits in a gap: UVM_ADD_SESSION is 0x0a and UVM_SET_STREAM_STOPPED is 0x07.
+        assert!(
+            !abi::uvm::v615_71_09::CMD.iter().any(|c| c.num == 0x08),
+            "0x08 must stay undefined for this test to mean anything"
+        );
+        let resp = send_uvm(&mut be, uvm, 0x08, &[0u8; 24]);
+        assert_ne!(parse_resp(&resp).status, 0);
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+    }
+
+    /// UVM copies its own struct's worth of bytes whatever the guest declared, so a short block is a read past what arrived.
+    #[test]
+    fn a_uvm_command_at_the_wrong_size_never_reaches_the_host() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        let resp = send_uvm(&mut be, uvm, UVM_RESERVE_VA, &[0u8; 16]);
+        assert_ne!(parse_resp(&resp).status, 0);
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+    }
+
+    /// The descriptor the guest wrote names nothing in this process.
+    #[test]
+    fn a_descriptor_inside_a_uvm_call_is_translated_both_ways() {
+        let host = UvmHost::default();
+        let (mut be, uvm, ctl) = uvm_backend(&host, v615());
+        let host_ctl = be.handles.get_raw(ctl).expect("the control file is open");
+
+        rm_client(&mut be, ctl, CLIENT);
+        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &register_gpu(ctl, CLIENT));
+        assert_eq!(parse_resp(&resp).status, 0);
+
+        let (_, sent) = host.calls().pop().expect("one call");
+        let seen = i32::from_le_bytes(
+            sent[REGISTER_GPU_FD..REGISTER_GPU_FD + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            seen, host_ctl,
+            "UVM must be given this process's descriptor"
+        );
+
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let back = i32::from_le_bytes(
+            resp[body + REGISTER_GPU_FD..body + REGISTER_GPU_FD + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(back, ctl as i32, "the guest reads back the number it wrote");
+    }
+
+    const CLIENT: u32 = 0xc1d0_0001;
+    const RM_ALLOC: u64 = 0xc030_462b; // _IOWR('F', 0x2b, NVOS64)
+    const RM_FREE: u64 = 0xc010_4629; // _IOWR('F', 0x29, NVOS00)
+
+    fn rm_on(be: &mut NvidiaBackend, h: u64, cmd: u64, params: &[u8]) -> i32 {
+        let mut v = hdr(MsgType::Ioctl, h);
+        append(
+            &mut v,
+            &IoctlReq {
+                cmd: cmd as u32,
+                data_len: params.len() as u32,
+                nested_offset: 0,
+                nested_len: 0,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        v.extend_from_slice(params);
+        let mut resp = vec![0u8; 64 * 1024];
+        be.dispatch(&v, &mut resp);
+        parse_resp(&resp).status
+    }
+
+    /// Allocate root client `client` on file `h`, as RM would answer it.
+    fn rm_client(be: &mut NvidiaBackend, h: u64, client: u32) {
+        let mut p = [0u8; 48];
+        p[8..12].copy_from_slice(&client.to_le_bytes());
+        p[12..16].copy_from_slice(&0x41u32.to_le_bytes());
+        assert_eq!(rm_on(be, h, RM_ALLOC, &p), 0);
+    }
+
+    fn register_gpu(ctl: u64, client: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 40];
+        p[REGISTER_GPU_FD..REGISTER_GPU_FD + 4].copy_from_slice(&(ctl as i32).to_le_bytes());
+        p[REGISTER_GPU_FD + 4..REGISTER_GPU_FD + 8].copy_from_slice(&client.to_le_bytes());
+        p
+    }
+
+    /// The descriptor is checked, and so is the client beside it: RM resolves the one through the other, so a client this file was never given is a call on someone else's objects.
+    #[test]
+    fn a_client_the_control_file_was_never_given_is_refused() {
+        let host = UvmHost::default();
+        let (mut be, uvm, ctl) = uvm_backend(&host, v615());
+        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &register_gpu(ctl, CLIENT));
+        assert_ne!(parse_resp(&resp).status, 0);
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+    }
+
+    #[test]
+    fn a_client_made_on_another_control_file_is_refused() {
+        let host = UvmHost::default();
+        let (mut be, uvm, ctl) = uvm_backend(&host, v615());
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let other = be.handles.insert(OwnedFd::from(null));
+        be.handle_kinds.insert(other, DeviceKind::Ctl);
+        rm_client(&mut be, other, CLIENT);
+        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &register_gpu(ctl, CLIENT));
+        assert_ne!(parse_resp(&resp).status, 0);
+        let nums = host.nums();
+        assert!(!nums.contains(&UVM_REGISTER_GPU), "host heard {nums:x?}");
+    }
+
+    #[test]
+    fn a_freed_client_is_refused() {
+        let host = UvmHost::default();
+        let (mut be, uvm, ctl) = uvm_backend(&host, v615());
+        rm_client(&mut be, ctl, CLIENT);
+        let mut free = [0u8; 16];
+        free[0..4].copy_from_slice(&CLIENT.to_le_bytes());
+        free[8..12].copy_from_slice(&CLIENT.to_le_bytes());
+        assert_eq!(rm_on(&mut be, ctl, RM_FREE, &free), 0);
+        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &register_gpu(ctl, CLIENT));
+        assert_ne!(parse_resp(&resp).status, 0);
+    }
+
+    /// The record follows RM's answer: a root allocation RM refused made no client, whatever handle the guest wrote.
+    #[test]
+    fn a_refused_root_allocation_issues_nothing() {
+        #[derive(Clone, Default)]
+        struct Refuses;
+        impl HostDriver for Refuses {
+            fn ioctl(&self, _: RawFd, req: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
+                if req & 0xff == 0x2b && arg.len() >= 44 {
+                    arg[40..44].copy_from_slice(&0x57u32.to_le_bytes());
+                }
+                Ok(())
+            }
+        }
+        let host = UvmHost::default();
+        let (mut be, uvm, ctl) = uvm_backend(&host, v615());
+        be.set_host(Box::new(Refuses));
+        let mut p = [0u8; 48];
+        p[8..12].copy_from_slice(&CLIENT.to_le_bytes());
+        p[12..16].copy_from_slice(&0x41u32.to_le_bytes());
+        rm_on(&mut be, ctl, RM_ALLOC, &p);
+        be.set_host(Box::new(host.clone()));
+        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &register_gpu(ctl, CLIENT));
+        assert_ne!(parse_resp(&resp).status, 0);
+    }
+
+    /// A call wanting `nvidiactl` handed a UVM file is a different call than the one UVM would act on, so the kind is checked and not just the ownership.
+    #[test]
+    fn a_descriptor_of_the_wrong_kind_is_refused() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        let mut p = vec![0u8; 40];
+        p[REGISTER_GPU_FD..REGISTER_GPU_FD + 4].copy_from_slice(&(uvm as i32).to_le_bytes());
+        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &p);
+        assert_ne!(parse_resp(&resp).status, 0);
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+    }
+
+    #[test]
+    fn a_descriptor_this_vm_never_opened_is_refused() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        for raw in [-2i32, 0, 4096] {
+            let mut p = vec![0u8; 40];
+            p[REGISTER_GPU_FD..REGISTER_GPU_FD + 4].copy_from_slice(&raw.to_le_bytes());
+            let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &p);
+            assert_ne!(parse_resp(&resp).status, 0, "descriptor {raw}");
+        }
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+    }
+
+    /// -1 is "none", and goes through as itself.
+    #[test]
+    fn a_descriptor_of_minus_one_is_none_and_goes_through() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        let mut p = vec![0u8; 40];
+        p[REGISTER_GPU_FD..REGISTER_GPU_FD + 4].copy_from_slice(&(-1i32).to_le_bytes());
+
+        let resp = send_uvm(&mut be, uvm, UVM_REGISTER_GPU, &p);
+        assert_eq!(parse_resp(&resp).status, 0, "the call is served");
+        assert_eq!(host.calls().len(), 1, "the host heard it once");
+        assert_eq!(
+            host.last_param(REGISTER_GPU_FD),
+            (-1i32) as u32,
+            "and it arrived as -1, not as one of this backend's descriptors"
+        );
+    }
+
+    /// There is no dma-buf this backend handed out, so the number can only name one of its own files by accident.
+    #[test]
+    fn a_foreign_descriptor_is_refused_rather_than_guessed_at() {
+        let host = UvmHost::default();
+        let (mut be, uvm, ctl) = uvm_backend(&host, v615());
+        let entry = abi::uvm::select(v615())
+            .unwrap()
+            .entry(UVM_IMPORT_DMA_BUF as u32)
+            .expect("615 imports dma-bufs");
+        let slot = entry.fds.first().expect("it carries a descriptor");
+        assert_eq!(slot.kind, abi::uvm::Fd::Foreign);
+
+        let mut p = vec![0u8; entry.params_size as usize];
+        p[slot.at..slot.at + 4].copy_from_slice(&(ctl as i32).to_le_bytes());
+        let resp = send_uvm(&mut be, uvm, UVM_IMPORT_DMA_BUF, &p);
+        assert_ne!(parse_resp(&resp).status, 0);
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+    }
+
+    /// Every guest process's UVM file is opened here, so a VA space tied to the caller's mm is tied to *this* process's.
+    #[test]
+    fn uvm_initialize_goes_with_the_backend_s_flags() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        let mut p = vec![0u8; 16];
+        p[0..8].copy_from_slice(&0u64.to_le_bytes()); // HMM on, no sharing mode
+        let resp = send_uvm(&mut be, uvm, UVM_INITIALIZE, &p);
+        assert_eq!(parse_resp(&resp).status, 0);
+        let (_, sent) = host.calls().remove(0);
+        assert_eq!(
+            u64::from_le_bytes(sent[0..8].try_into().unwrap()),
+            0x7,
+            "615.71.09 has all three bits"
+        );
+    }
+
+    /// 535/580/595 have no DISABLE_PAGEABLE_ACCESS bit, so the backend cannot ask for it and has to establish it instead.
+    #[test]
+    fn an_older_release_is_asked_whether_pageable_access_is_off() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, abi::version::DriverVersion::new(595, 104, 2));
+        let resp = send_uvm(&mut be, uvm, UVM_INITIALIZE, &[0u8; 16]);
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(host.nums(), vec![UVM_INITIALIZE, UVM_PAGEABLE_MEM_ACCESS]);
+        let (_, sent) = host.calls().remove(0);
+        assert_eq!(
+            u64::from_le_bytes(sent[0..8].try_into().unwrap()),
+            0x3,
+            "595 has no bit for pageable access and must not be sent one"
+        );
+    }
+
+    /// 615 has the bit, so it is asked for and nothing needs establishing afterwards.
+    #[test]
+    fn a_release_with_the_flag_is_not_asked() {
+        let host = UvmHost::default();
+        let (mut be, uvm, _) = uvm_backend(&host, v615());
+        send_uvm(&mut be, uvm, UVM_INITIALIZE, &[0u8; 16]);
+        assert_eq!(host.nums(), vec![UVM_INITIALIZE]);
+    }
+
+    /// The refusal, triggered.
+    #[test]
+    fn a_va_space_that_allows_pageable_access_serves_nothing_further() {
+        let host = UvmHost::default();
+        host.pageable_is_on();
+        let (mut be, uvm, _) = uvm_backend(&host, abi::version::DriverVersion::new(595, 104, 2));
+
+        let resp = send_uvm(&mut be, uvm, UVM_INITIALIZE, &[0u8; 16]);
+        assert_ne!(
+            parse_resp(&resp).status,
+            0,
+            "UVM_INITIALIZE must be refused"
+        );
+
+        // The host file is initialised by now and cannot be un-initialised, so the refusal has to stick to the handle.
+        let before = host.nums().len();
+        let resp = send_uvm(&mut be, uvm, UVM_RESERVE_VA, &[0u8; 24]);
+        assert_ne!(parse_resp(&resp).status, 0, "the file is finished");
+        assert_eq!(host.nums().len(), before, "host heard {:x?}", host.nums());
+    }
+
+    /// What the guest is told about UVM.
+    #[test]
+    fn the_guest_is_told_the_shape_of_every_uvm_call() {
+        let host = UvmHost::default();
+        let (be, _, _) = uvm_backend(&host, v615());
+        let mut buf = vec![0u8; 8192];
+        let n = be.write_uvm_section(&mut buf);
+        assert!(n >= 8, "the section was not written");
+
+        let word = |i: usize| u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(word(0), NvidiaBackend::UVM_CMD_MAGIC);
+        let count = word(1) as usize;
+        assert_eq!(n, 8 + count * 16);
+        assert_eq!(count, abi::uvm::v615_71_09::CMD.len());
+
+        for (i, c) in abi::uvm::v615_71_09::CMD.iter().enumerate() {
+            let at = 2 + i * 4;
+            assert_eq!(word(at), c.num, "command {i}");
+            assert_eq!(word(at + 1), c.params_size, "{:#x} size", c.num);
+            let (kind, off) = match c.fds {
+                [] => (0, 0),
+                [one] => (
+                    match one.kind {
+                        abi::uvm::Fd::Ctl => 1,
+                        abi::uvm::Fd::Uvm => 2,
+                        abi::uvm::Fd::Foreign => 3,
+                    },
+                    one.at as u32,
+                ),
+                _ => unreachable!("a_uvm_command_carries_at_most_one_descriptor"),
+            };
+            assert_eq!(word(at + 2), kind, "{:#x} descriptor kind", c.num);
+            assert_eq!(word(at + 3), off, "{:#x} descriptor offset", c.num);
+        }
+
+        // The eight that carry one, so a change to the generator that dropped them would not pass quietly.
+        assert_eq!(
+            (0..count).filter(|i| word(2 + i * 4 + 2) != 0).count(),
+            8,
+            "615.71.09 carries eight descriptors"
+        );
+    }
+
+    /// Nothing learned about the host means nothing said about UVM, and the guest refuses every UVM call rather than reading a zeroed buffer as an answer.
+    #[test]
+    fn a_backend_with_no_release_describes_no_uvm_call() {
+        let be = NvidiaBackend::for_test();
+        let mut buf = vec![0u8; 8192];
+        assert_eq!(be.write_uvm_section(&mut buf), 0);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    /// Without a release nothing says what a UVM call is, so nothing is one.
+    #[test]
+    fn no_uvm_call_is_served_before_the_release_is_known() {
+        let host = UvmHost::default();
+        let mut be = NvidiaBackend::for_test();
+        be.set_host(Box::new(host.clone()));
+        let null = std::fs::File::open("/dev/null").expect("/dev/null");
+        let uvm = be.handles.insert(OwnedFd::from(null));
+        be.handle_kinds.insert(uvm, DeviceKind::Uvm);
+
+        let resp = send_uvm(&mut be, uvm, UVM_RESERVE_VA, &[0u8; 24]);
+        assert_ne!(parse_resp(&resp).status, 0);
+        assert!(host.calls().is_empty(), "host heard {:x?}", host.nums());
+    }
+
+    // ================================================================== Video memory ==================================================================
+
+    const VID_HEAP: u64 = 0xc0b8_464a; // _IOWR('F', 0x4a, NVOS32), 184 bytes
+
+    /// An NVOS32 ALLOC_SIZE of `mib` MiB of video memory as `h_memory` under `parent`, on 615.71.09's layout.
+    fn vid_alloc(client: u32, parent: u32, h_memory: u32, mib: u64) -> Vec<u8> {
+        let l = &abi::vidmem::v615_71_09::LAYOUT;
+        let a = l.nvos32_alloc_size;
+        let mut p = vec![0u8; l.nvos32_size as usize];
+        let put = |p: &mut Vec<u8>, at: u32, v: &[u8]| {
+            p[at as usize..at as usize + v.len()].copy_from_slice(v)
+        };
+        put(&mut p, 0, &client.to_le_bytes());
+        put(&mut p, 4, &parent.to_le_bytes());
+        put(
+            &mut p,
+            l.nvos32_function,
+            &l.nvos32_fn_alloc_size.to_le_bytes(),
+        );
+        put(&mut p, a.h_memory, &h_memory.to_le_bytes());
+        // attr 0: located in video memory on this release.
+        put(&mut p, a.size, &(mib << 20).to_le_bytes());
+        p
+    }
+
+    fn vid_status(be: &mut NvidiaBackend, h: u64, params: &[u8]) -> u32 {
+        let mut v = hdr(MsgType::Ioctl, h);
+        append(
+            &mut v,
+            &IoctlReq {
+                cmd: VID_HEAP as u32,
+                data_len: params.len() as u32,
+                nested_offset: 0,
+                nested_len: 0,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        v.extend_from_slice(params);
+        let mut resp = vec![0u8; 64 * 1024];
+        be.dispatch(&v, &mut resp);
+        assert_eq!(parse_resp(&resp).status, 0, "the ioctl itself succeeds");
+        let at = IOCTL_BODY + abi::vidmem::v615_71_09::LAYOUT.nvos32_status as usize;
+        u32::from_le_bytes(resp[at..at + 4].try_into().unwrap())
+    }
+
+    fn free(be: &mut NvidiaBackend, h: u64, client: u32, parent: u32, handle: u32) {
+        let mut p = [0u8; 16];
+        p[0..4].copy_from_slice(&client.to_le_bytes());
+        p[4..8].copy_from_slice(&parent.to_le_bytes());
+        p[8..12].copy_from_slice(&handle.to_le_bytes());
+        assert_eq!(rm_on(be, h, RM_FREE, &p), 0);
+    }
+
+    /// The limit is held on the route Vulkan uses: an allocation past it is answered NV_ERR_NO_MEMORY without reaching the host, and a free gives the room back.
+    #[test]
+    fn video_memory_past_the_limit_is_refused_and_a_free_returns_it() {
+        let host = UvmHost::default();
+        let (mut be, _, ctl) = uvm_backend(&host, v615());
+        be.set_vram_limit_mib(Some(100)).unwrap();
+        rm_client(&mut be, ctl, CLIENT);
+
+        assert_eq!(
+            vid_status(&mut be, ctl, &vid_alloc(CLIENT, CLIENT, 0x10, 60)),
+            0
+        );
+        let heard = host.calls().len();
+        assert_eq!(
+            vid_status(&mut be, ctl, &vid_alloc(CLIENT, CLIENT, 0x11, 60)),
+            0x51
+        );
+        assert_eq!(
+            host.calls().len(),
+            heard,
+            "a refused allocation never reaches the host"
+        );
+        assert_eq!(be.vram.in_use(), 60 << 20);
+
+        free(&mut be, ctl, CLIENT, CLIENT, 0x10);
+        assert_eq!(be.vram.in_use(), 0);
+        assert_eq!(
+            vid_status(&mut be, ctl, &vid_alloc(CLIENT, CLIENT, 0x11, 60)),
+            0
+        );
+    }
+
+    /// Freeing the object an allocation was made under frees the allocation, as RM does.
+    #[test]
+    fn freeing_a_parent_releases_the_video_memory_under_it() {
+        let host = UvmHost::default();
+        let (mut be, _, ctl) = uvm_backend(&host, v615());
+        be.set_vram_limit_mib(Some(100)).unwrap();
+        rm_client(&mut be, ctl, CLIENT);
+        // A device under the client, and memory under the device.
+        let mut dev = [0u8; 48];
+        dev[0..4].copy_from_slice(&CLIENT.to_le_bytes());
+        dev[4..8].copy_from_slice(&CLIENT.to_le_bytes());
+        dev[8..12].copy_from_slice(&0x20u32.to_le_bytes());
+        dev[12..16].copy_from_slice(&0x80u32.to_le_bytes());
+        rm_on(&mut be, ctl, RM_ALLOC, &dev);
+        assert_eq!(
+            vid_status(&mut be, ctl, &vid_alloc(CLIENT, 0x20, 0x30, 80)),
+            0
+        );
+        assert_eq!(be.vram.in_use(), 80 << 20);
+        free(&mut be, ctl, CLIENT, CLIENT, 0x20);
+        assert_eq!(be.vram.in_use(), 0);
+    }
+
+    /// Without its own release's table the limit could not be held, and the backend says so instead of announcing it.
+    #[test]
+    fn a_limit_without_this_releases_table_is_refused() {
+        let mut be = NvidiaBackend::for_test();
+        assert!(
+            be.set_vram_limit_mib(Some(100)).is_err(),
+            "no release known"
+        );
+        be.set_host_driver_version(abi::version::DriverVersion::new(600, 0, 0))
+            .unwrap();
+        assert!(
+            be.set_vram_limit_mib(Some(100)).is_err(),
+            "a neighbour's table"
+        );
+        assert!(be.set_vram_limit_mib(None).is_ok());
+        be.set_host_driver_version(v615()).unwrap();
+        assert!(be.set_vram_limit_mib(Some(100)).is_ok());
+    }
+}

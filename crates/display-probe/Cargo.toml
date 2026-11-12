@@ -1,0 +1,36 @@
+[package]
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+name = "legion-display-probe"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["host-ui"]
+host-ui = ["dep:sdl2"]
+guest-vulkan = ["dep:ash"]
+
+[dependencies]
+anyhow = "1.0"
+serde_json = "1.0"
+legion-display-channel = { path = "../display-channel" }
+sdl2 = { version = "0.38", optional = true }
+ash = { version = "0.38", optional = true }
+
+[[bin]]
+name = "legion-presenter"
+path = "src/presenter.rs"
+required-features = ["host-ui"]
+
+[[bin]]
+name = "legion-guest-display"
+path = "src/guest.rs"
+required-features = ["guest-vulkan"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"

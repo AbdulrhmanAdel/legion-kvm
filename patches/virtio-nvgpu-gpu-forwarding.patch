@@ -1,0 +1,384 @@
+--- a/device/Cargo.toml
++++ b/device/Cargo.toml
+@@ -5,6 +5,7 @@
+ license = "Apache-2.0"
+ 
+ [dependencies]
++legion-gpu-presenter = { path = "../../../../gpu-presenter" }
+ protocol = { workspace = true }
+ abi      = { workspace = true }
+ 
+--- a/device/src/nvidia/mod.rs
++++ b/device/src/nvidia/mod.rs
+@@ -269,6 +269,7 @@
+     /// the transport supplies one, and without it a mapping can be made on the
+     /// host but never reached from the guest.
+     window: Option<Box<dyn crate::shm::WindowPlacer>>,
++    legion_display: Option<legion_display::Display>,
+     /// Window placements made for a DRM object, keyed by the node handle and
+     /// the object's mmap offset on the host.
+     ///
+@@ -369,6 +370,7 @@
+     pub fn new(cfg: ZoneConfig) -> Self {
+         Self {
+             window: None,
++            legion_display: None,
+             dri_maps: std::collections::HashMap::new(),
+             aperture: Default::default(),
+             dri_given: Default::default(),
+@@ -783,6 +785,7 @@
+                 );
+             }
+         }
++        self.legion_display.take();
+         self.handles.drain_all();
+     }
+ 
+@@ -879,6 +882,7 @@
+ mod host;
+ pub use host::{HostDriver, RealHost};
+ mod ioctl;
++mod legion_display;
+ mod nested;
+ mod open;
+ mod osdesc;
+--- a/device/src/nvidia/ioctl.rs
++++ b/device/src/nvidia/ioctl.rs
+@@ -371,6 +371,13 @@
+             Ok(fd) => fd,
+             Err(_) => return self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0),
+         };
++
++        if ((request >> 8) & 0xff) == u64::from(b'L') {
++            if ireq.nested_len != 0 || ireq.deep_len != 0 {
++                return self.write_error_resp(resp_buf, Status::InvalidMsgType, cookie, libc::EINVAL);
++            }
++            return self.handle_legion_display(host_fd, ireq.cmd, param_in, resp_buf);
++        }
+ 
+         let escape = (request & 0xFF) as u32;
+         let ioc_type = ((request >> 8) & 0xFF) as u32;
+--- a/device/bin/vhost-user-nvgpu.rs
++++ b/device/bin/vhost-user-nvgpu.rs
+@@ -73,6 +73,10 @@
+     /// one refuses to start a guest on a backend that is not enforcing it.
+     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+     vram_limit_mib: Option<u64>,
++
++    /// Experimental host Wayland presentation, WIDTHxHEIGHT.
++    #[arg(long)]
++    legion_display: Option<String>,
+ }
+ 
+ /// Places device memory through the vhost-user backend request channel.
+@@ -719,6 +723,10 @@
+         args.caps,
+         args.vram_limit_mib,
+     )?));
++    if let Some(size) = &args.legion_display {
++        let (width, height) = size.split_once('x').ok_or_else(|| anyhow::anyhow!("display size must be WIDTHxHEIGHT"))?;
++        backend.write().map_err(|_| anyhow::anyhow!("backend lock"))?.nvidia.lock().map_err(|_| anyhow::anyhow!("NVIDIA lock"))?.enable_legion_display(width.parse()?, height.parse()?)?;
++    }
+     // vhost_user_backend::Error does not implement std::error::Error, so it
+     // cannot ride `?` on its own.
+     let mut daemon = VhostUserDaemon::new(
+--- a/driver/virtio_gpu_nv.c
++++ b/driver/virtio_gpu_nv.c
+@@ -4559,6 +4559,60 @@
+  *   type 'F'                              NVIDIA RM, proxied to the host like
+  *                                         on any other node.
+  */
++/* Private, pointer-free display control; never forwarded to a host ioctl. */
++struct nvgpu_legion_register {
++  __u32 handle, width, height, fourcc;
++  __u64 modifier;
++  __u32 stride, offset;
++  __u64 resource;
++  __u32 client, pad;
++};
++
++static long nvgpu_legion_display_ioctl(struct nvgpu_fd *nfd,
++                                       struct drm_file *file,
++                                       unsigned int cmd, unsigned long arg) {
++  unsigned int size;
++  u32 owner = nfd->handle, saved_handle = 0;
++  void *data;
++  long ret;
++  BUILD_BUG_ON(sizeof(struct nvgpu_legion_register) != 48);
++  switch (_IOC_NR(cmd)) {
++  case 1: size = 4112; break;
++  case 2: size = 48; break;
++  case 3: size = 16; break;
++  case 4: size = 264; break;
++  case 5: size = 8; break;
++  case 6: size = 40; break;
++  default: return -ENOTTY;
++  }
++  if (_IOC_SIZE(cmd) != size || _IOC_DIR(cmd) != (_IOC_READ | _IOC_WRITE))
++    return -EINVAL;
++  data = memdup_user((void __user *)arg, size);
++  if (IS_ERR(data))
++    return PTR_ERR(data);
++  if (_IOC_NR(cmd) == 2) {
++    struct nvgpu_legion_register *p = data;
++    u32 host;
++    saved_handle = p->handle;
++    ret = nvgpu_gem_to_host(file, p->handle, &host, &owner);
++    if (ret)
++      goto out;
++    p->handle = host;
++    p->client = nfd->handle;
++  }
++  ret = nvgpu_ioctl_flat_h(nfd->dev, owner, cmd, data, size);
++  if (_IOC_NR(cmd) == 2) {
++    struct nvgpu_legion_register *p = data;
++    p->handle = saved_handle;
++    p->client = 0;
++  }
++  if (!ret && copy_to_user((void __user *)arg, data, size))
++    ret = -EFAULT;
++out:
++  kfree(data);
++  return ret;
++}
++
+ static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
+                                      unsigned long arg) {
+   struct drm_file *file = filp->private_data;
+@@ -4568,6 +4622,9 @@
+   if (!file || !file->driver_priv)
+     return -ENODEV;
+   nfd = file->driver_priv;
++
++  if (_IOC_TYPE(cmd) == 'L')
++    return nvgpu_legion_display_ioctl(nfd, file, cmd, arg);
+ 
+   if (_IOC_TYPE(cmd) == DRM_IOCTL_BASE) {
+     if (nr >= DRM_COMMAND_BASE && nr < DRM_COMMAND_END) {
+--- /dev/null
++++ b/device/src/nvidia/legion_display.rs
+@@ -0,0 +1,224 @@
++//! Opt-in host presentation. Only owned DRM objects can be exported here.
++use super::*;
++use legion_gpu_presenter::{Format, Image, Plane, Presenter};
++use std::os::fd::FromRawFd;
++
++pub(super) struct Display {
++    presenter: Presenter,
++    client: Option<u32>,
++    next: u64,
++}
++
++fn word(data: &[u8], at: usize) -> u32 {
++    u32::from_le_bytes(data[at..at + 4].try_into().expect("validated packet"))
++}
++fn wide(data: &[u8], at: usize) -> u64 {
++    u64::from_le_bytes(data[at..at + 8].try_into().expect("validated packet"))
++}
++
++fn export_owned_dmabuf(
++    host: &dyn HostDriver,
++    file: RawFd,
++    gem: u32,
++) -> std::result::Result<OwnedFd, i32> {
++    let mut prime = [0_u8; 12];
++    prime[..4].copy_from_slice(&gem.to_le_bytes());
++    let flags = u32::try_from(libc::O_CLOEXEC | libc::O_RDWR).map_err(|_| libc::EINVAL)?;
++    prime[4..8].copy_from_slice(&flags.to_le_bytes());
++    prime[8..].copy_from_slice(&(-1_i32).to_le_bytes());
++    host.ioctl(file, 0xc00c_642d, &mut prime)?;
++    let fd = i32::from_le_bytes(prime[8..12].try_into().expect("fixed PRIME packet"));
++    if fd < 0 {
++        return Err(libc::EIO);
++    }
++    // SAFETY: successful PRIME_HANDLE_TO_FD returns a new CLOEXEC FD.
++    // No other owner is created; all error paths before this retain no FD.
++    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
++}
++
++impl NvidiaBackend {
++    pub fn enable_legion_display(&mut self, width: i32, height: i32) -> anyhow::Result<()> {
++        anyhow::ensure!(
++            self.caps.has(crate::caps::GRAPHICS),
++            "presentation requires graphics capability"
++        );
++        self.legion_display = Some(Display {
++            presenter: Presenter::connect(width, height)?,
++            client: None,
++            next: 1,
++        });
++        Ok(())
++    }
++
++    pub(super) fn handle_legion_display(
++        &mut self,
++        host_fd: RawFd,
++        cmd: u32,
++        data: &[u8],
++        response: &mut [u8],
++    ) -> usize {
++        let outcome = (|| -> anyhow::Result<Vec<u8>> {
++            anyhow::ensure!(
++                matches!(
++                    self.handle_kinds.get(&u64::from(self.current_handle)),
++                    Some(DeviceKind::Dri(_))
++                ),
++                "presentation requires an owned DRM file"
++            );
++            let nr = cmd & 0xff;
++            let size = match nr {
++                1 => 4112,
++                2 => 48,
++                3 => 16,
++                4 => 264,
++                5 => 8,
++                6 => 40,
++                _ => anyhow::bail!("unknown presentation operation"),
++            };
++            anyhow::ensure!(
++                data.len() == size && ((cmd >> 16) & 0x3fff) as usize == size,
++                "presentation packet size mismatch"
++            );
++            anyhow::ensure!(cmd >> 30 == 3, "presentation ioctl requires read/write direction");
++            let mut out = data.to_vec();
++            let display = self
++                .legion_display
++                .as_mut()
++                .ok_or_else(|| anyhow::anyhow!("host presentation is disabled"))?;
++            display.presenter.pump()?;
++            if nr == 1 {
++                anyhow::ensure!(
++                    display.client.is_none_or(|id| id == self.current_handle),
++                    "presentation belongs to another file"
++                );
++                display.client = Some(self.current_handle);
++            } else {
++                let client = if nr == 2 {
++                    word(data, 40)
++                } else {
++                    self.current_handle
++                };
++                anyhow::ensure!(display.client == Some(client), "presentation file mismatch");
++            }
++            match nr {
++                1 => {
++                    let info = display.presenter.info()?;
++                    anyhow::ensure!(
++                        info.formats.len() <= 256,
++                        "too many display formats for v1 packet"
++                    );
++                    out.fill(0);
++                    out[..4].copy_from_slice(&1_u32.to_le_bytes());
++                    out[4..8].copy_from_slice(&u32::try_from(info.formats.len())?.to_le_bytes());
++                    out[8..16].copy_from_slice(&info.main_device.to_le_bytes());
++                    for (index, format) in info.formats.iter().enumerate() {
++                        let at = 16 + index * 16;
++                        out[at..at + 4].copy_from_slice(&format.fourcc.to_le_bytes());
++                        out[at + 8..at + 16].copy_from_slice(&format.modifier.to_le_bytes());
++                    }
++                }
++                2 => {
++                    let fd = export_owned_dmabuf(self.host.as_ref(), host_fd, word(data, 0))
++                        .map_err(|errno| anyhow::anyhow!("host PRIME export errno {errno}"))?;
++                    let id = display.next;
++                    display.next = display
++                        .next
++                        .checked_add(1)
++                        .ok_or_else(|| anyhow::anyhow!("resource ID overflow"))?;
++                    display.presenter.register(Image {
++                        id,
++                        width: i32::try_from(word(data, 4))?,
++                        height: i32::try_from(word(data, 8))?,
++                        format: Format {
++                            fourcc: word(data, 12),
++                            modifier: wide(data, 16),
++                        },
++                        y_inverted: word(data, 44) & 1 != 0,
++                        planes: vec![Plane {
++                            fd,
++                            stride: word(data, 24),
++                            offset: word(data, 28),
++                        }],
++                    })?;
++                    out[32..40].copy_from_slice(&id.to_le_bytes());
++                }
++                3 => display.presenter.present(wide(data, 0), wide(data, 8))?,
++                4 => {
++                    out.fill(0);
++                    let mut count = 0_u32;
++                    while count < 16 {
++                        let Some(release) = display.presenter.pop_release() else {
++                            break;
++                        };
++                        let at = 8 + usize::try_from(count)? * 16;
++                        out[at..at + 8].copy_from_slice(&release.id.to_le_bytes());
++                        out[at + 8..at + 16].copy_from_slice(&release.frame.to_le_bytes());
++                        count += 1;
++                    }
++                    out[..4].copy_from_slice(&count.to_le_bytes());
++                }
++                5 => display.presenter.retire(wide(data, 0))?,
++                6 => {
++                    let s = display.presenter.stats();
++                    for (index, value) in
++                        [s.imports, s.commits, s.releases, s.callbacks, s.fence_waits]
++                            .into_iter()
++                            .enumerate()
++                    {
++                        out[index * 8..index * 8 + 8].copy_from_slice(&value.to_le_bytes());
++                    }
++                }
++                _ => unreachable!(),
++            }
++            Ok(out)
++        })();
++        match outcome {
++            Ok(data) => self.write_ioctl_resp(response, 0, &data),
++            Err(error) => {
++                log::warn!("Legion display operation {} failed: {error:#}", cmd & 0xff);
++                self.write_error_resp(response, Status::InvalidMsgType, 0, libc::EIO)
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    struct RefusingKernel;
++    impl HostDriver for RefusingKernel {
++        fn ioctl(&self, fd: RawFd, request: u64, arg: &mut [u8]) -> std::result::Result<(), i32> {
++            assert_eq!(fd, 17);
++            assert_eq!(request, 0xc00c_642d);
++            assert_eq!(arg.len(), 12);
++            assert_eq!(word(arg, 0), 7);
++            let flags = word(arg, 4);
++            assert_ne!(flags & u32::try_from(libc::O_CLOEXEC).expect("flag"), 0);
++            assert_eq!(
++                flags & u32::try_from(libc::O_ACCMODE).expect("mode"),
++                u32::try_from(libc::O_RDWR).expect("RDWR")
++            );
++            assert_eq!(i32::from_le_bytes(arg[8..].try_into().expect("FD")), -1);
++            Err(libc::EACCES)
++        }
++    }
++    #[test]
++    fn prime_export_uses_real_drm_flags_and_preserves_kernel_error() {
++        assert_eq!(
++            export_owned_dmabuf(&RefusingKernel, 17, 7).err(),
++            Some(libc::EACCES)
++        );
++    }
++    #[test]
++    #[cfg(not(miri))] // The backend constructor creates a real SHM memfd.
++    fn display_requests_on_non_drm_handles_fail_without_calling_the_kernel() {
++        let mut backend = NvidiaBackend::with_default_zones();
++        backend.current_handle = 17;
++        backend.handle_kinds.insert(17, DeviceKind::Ctl);
++        backend.set_host(Box::new(RefusingKernel));
++        let mut response = [0_u8; 64];
++        let n = backend.handle_legion_display(-1, 0xc030_4c02, &[0; 48], &mut response);
++        assert_eq!(n, 16);
++        assert!(i32::from_le_bytes(response[8..12].try_into().expect("status")) < 0);
++    }
++}

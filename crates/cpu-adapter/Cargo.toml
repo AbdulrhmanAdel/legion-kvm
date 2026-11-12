@@ -1,0 +1,31 @@
+[package]
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+name = "legion-cpu-adapter"
+version.workspace = true
+edition.workspace = true
+description = "Guest CPU and syscall compatibility adapter"
+
+[features]
+exit-diagnostics = []
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+
+[[bin]]
+name = "legion-cpu-adapter-fixture"
+path = "src/fixture.rs"
+test = false
+
+[dependencies]
+libc = { version = "0.2", default-features = false }
+legion-cpu-contract = { path = "../cpu-contract" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"

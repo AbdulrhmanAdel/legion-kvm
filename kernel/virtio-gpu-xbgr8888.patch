@@ -1,0 +1,32 @@
+--- a/drivers/gpu/drm/virtio/virtgpu_plane.c
++++ b/drivers/gpu/drm/virtio/virtgpu_plane.c
+@@ -35,6 +35,7 @@
+ 
+ static const uint32_t virtio_gpu_formats[] = {
+ 	DRM_FORMAT_HOST_XRGB8888,
++	DRM_FORMAT_XBGR8888,
+ };
+ 
+ static const uint32_t virtio_gpu_cursor_formats[] = {
+@@ -57,6 +58,9 @@
+ 		break;
+ 	case DRM_FORMAT_BGRA8888:
+ 		format = VIRTIO_GPU_FORMAT_A8R8G8B8_UNORM;
++		break;
++	case DRM_FORMAT_XBGR8888:
++		format = VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM;
+ 		break;
+ 	default:
+ 		/*
+--- a/drivers/gpu/drm/virtio/virtgpu_display.c
++++ b/drivers/gpu/drm/virtio/virtgpu_display.c
+@@ -301,7 +301,8 @@
+ 	int ret;
+ 
+ 	if (mode_cmd->pixel_format != DRM_FORMAT_HOST_XRGB8888 &&
+-	    mode_cmd->pixel_format != DRM_FORMAT_HOST_ARGB8888)
++	    mode_cmd->pixel_format != DRM_FORMAT_HOST_ARGB8888 &&
++	    mode_cmd->pixel_format != DRM_FORMAT_XBGR8888)
+ 		return ERR_PTR(-ENOENT);
+ 
+ 	/* lookup object associated with res handle */

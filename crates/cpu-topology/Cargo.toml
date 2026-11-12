@@ -1,0 +1,21 @@
+[package]
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+name = "legion-cpu-topology"
+version.workspace = true
+edition.workspace = true
+description = "Shared Linux socket/core/SMT detection for Legion host and guest probes"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"

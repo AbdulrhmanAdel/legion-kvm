@@ -1,0 +1,31 @@
+[package]
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+name = "legion-guest-compositor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+drm = "0.14"
+sdl2 = "0.38"
+serde_json = "1.0"
+legion-display-channel = { path = "../display-channel" }
+smithay = { version = "0.7", default-features = false, features = ["wayland_frontend", "backend_egl", "renderer_gl", "backend_drm", "xwayland"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+libc = "0.2"
+xkbcommon = "0.8"
+rustix = { version = "1.1", features = ["event", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"

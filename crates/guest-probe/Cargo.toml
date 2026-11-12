@@ -1,0 +1,23 @@
+[package]
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+name = "legion-guest-probe"
+version.workspace = true
+edition.workspace = true
+description = "Static guest initialization and capability checks"
+
+[dependencies]
+anyhow = "1.0"
+libc = "0.2"
+serde_json = "1.0"
+legion-cpu-topology = { path = "../cpu-topology" }
+legion-shared-directories = { path = "../shared-directories" }
+rustix = { version = "1.1", features = ["mount", "system", "fs"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"

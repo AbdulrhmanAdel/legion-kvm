@@ -1,0 +1,481 @@
+--- a/device/bin/vhost-user-nvgpu.rs
++++ b/device/bin/vhost-user-nvgpu.rs
+@@ -199,6 +199,8 @@
+ /// What the event thread is told to start and stop watching.
+ enum Watch {
+     Display(OwnedFd),
++    Fence(u64, OwnedFd),
++    RemoveFence(u64),
+     Add(u32, OwnedFd),
+     Remove(u32),
+ }
+@@ -307,6 +309,24 @@
+     }
+ }
+ 
++const FENCE_EVENT_KEY: u64 = 1_u64 << 63;
++
++// True means the one-shot watch can retire. Delivery is committed only after
++// the event queue accepts the packet; lack of buffers leaves it retryable.
++fn fence_ready(nvidia: &Arc<Mutex<NvidiaBackend>>, vring: &VringRwLock,
++               mem: &GuestMemoryAtomic<GuestMemoryMmap>, key: u64) -> bool {
++    let token = key & !FENCE_EVENT_KEY;
++    let packet = nvidia.lock().expect("backend mutex").begin_legion_fence_event(token);
++    if let Some(packet) = packet {
++        let accepted = push_event_data(vring, mem, &packet, true);
++        // CLOSE may run between queue publication and this receipt. Never
++        // hold the backend lock while accessing the event virtqueue.
++        nvidia.lock().expect("backend mutex").finish_legion_fence_event(token, accepted);
++        return accepted;
++    }
++    nvidia.lock().expect("backend mutex").legion_fence_watch_finished(token)
++}
++
+ fn event_pump(
+     rx: Receiver<Watch>,
+     vring: VringRwLock,
+@@ -357,6 +377,18 @@
+                         log::error!("display epoll registration failed");
+                     }
+                 }
++                Ok(Watch::Fence(token, fd)) => {
++                    let key = FENCE_EVENT_KEY | token;
++                    if ctl(libc::EPOLL_CTL_ADD, fd.as_raw_fd(), key) == 0 {
++                        watched.insert(key, fd);
++                    } else { log::error!("fence epoll registration failed"); }
++                }
++                Ok(Watch::RemoveFence(token)) => {
++                    let key = FENCE_EVENT_KEY | token;
++                    if let Some(fd) = watched.remove(&key) {
++                        ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), key);
++                    }
++                }
+                 Ok(Watch::Add(handle, fd)) => {
+                     if ctl(libc::EPOLL_CTL_ADD, fd.as_raw_fd(), u64::from(handle)) == 0 {
+                         watched.insert(handle as u64, fd);
+@@ -382,6 +414,7 @@
+             if watched.contains_key(&DISPLAY_EVENT_KEY) {
+                 display_events(&nvidia, &vring, &mem);
+             }
++            let mut retired = Vec::new();
+             for (&handle, fd) in watched.iter() {
+                 if handle == DISPLAY_EVENT_KEY {
+                     continue;
+@@ -392,8 +425,13 @@
+                     revents: 0,
+                 };
+                 if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 && pfd.revents & libc::POLLIN != 0 {
+-                    push_event(&vring, &mem, handle as u32);
++                    if handle & FENCE_EVENT_KEY != 0 {
++                        if fence_ready(&nvidia, &vring, &mem, handle) { retired.push(handle); }
++                    } else { push_event(&vring, &mem, handle as u32); }
+                 }
++            }
++            for key in retired {
++                if let Some(fd) = watched.remove(&key) { ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), key); }
+             }
+         }
+ 
+@@ -421,6 +459,11 @@
+             let key = { ev.u64 };
+             if key == DISPLAY_EVENT_KEY {
+                 display_events(&nvidia, &vring, &mem);
++                continue;
++            }
++            if key & FENCE_EVENT_KEY != 0 {
++                if !fence_ready(&nvidia, &vring, &mem, key) { continue; }
++                if let Some(fd) = watched.remove(&key) { ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), key); }
+                 continue;
+             }
+             let handle = key as u32;
+@@ -516,6 +559,7 @@
+             .lock()
+             .expect("backend mutex")
+             .take_watch_updates();
++        let (fence_added, fence_removed) = self.nvidia.lock().expect("backend mutex").take_legion_fence_watches();
+         let display_fd = if self.display_watch {
+             None
+         } else {
+@@ -524,7 +568,7 @@
+                 .expect("backend mutex")
+                 .legion_display_event_fd()
+         };
+-        if added.is_empty() && removed.is_empty() && display_fd.is_none() && self.watches.is_some()
++        if added.is_empty() && removed.is_empty() && fence_added.is_empty() && fence_removed.is_empty() && display_fd.is_none() && self.watches.is_some()
+         {
+             return;
+         }
+@@ -564,6 +608,8 @@
+         for handle in removed {
+             let _ = tx.send(Watch::Remove(handle));
+         }
++        for (token, fd) in fence_added { let _ = tx.send(Watch::Fence(token, fd)); }
++        for token in fence_removed { let _ = tx.send(Watch::RemoveFence(token)); }
+     }
+ 
+     /// Drain one virtqueue, dispatching every chain.
+@@ -932,9 +978,10 @@
+ 
+     #[test]
+     fn completion_payload_requires_full_buffer_and_survives_a_short_descriptor() {
++        for length in [32_u32, 280] {
+         let (mem, vring) = queue();
+         let guard = mem.memory();
+-        let payload = [0x5a; 280];
++        let payload = vec![0x5a; length as usize];
+         descriptor(&guard, 0, 0x4000, 16, 2, 0);
+         post(&guard, 0, 0);
+         assert!(!push_event_data(&vring, &mem, &payload, false));
+@@ -946,14 +993,15 @@
+             .unwrap();
+         assert_eq!(untouched, [0; 16]);
+         // The publisher retains its payload after false and retries intact.
+-        descriptor(&guard, 1, 0x5000, 280, 2, 0);
++        descriptor(&guard, 1, 0x5000, length, 2, 0);
+         post(&guard, 1, 1);
+         assert!(push_event_data(&vring, &mem, &payload, false));
+         assert_eq!(used(&guard), 2);
+-        assert_eq!(guard.read_obj::<u32>(GuestAddress(0x3010)).unwrap(), 280);
+-        let mut actual = [0; 280];
++        assert_eq!(guard.read_obj::<u32>(GuestAddress(0x3010)).unwrap(), length);
++        let mut actual = vec![0; length as usize];
+         guard.read_slice(&mut actual, GuestAddress(0x5000)).unwrap();
+         assert_eq!(actual, payload);
++        }
+     }
+ 
+     #[test]
+--- a/driver/virtio_gpu_nv.c
++++ b/driver/virtio_gpu_nv.c
+@@ -13,6 +13,11 @@
+ 
+ #include <drm/drm.h>
+ #include <linux/cdev.h>
++#include <linux/dma-fence.h>
++#include <linux/sync_file.h>
++#include <linux/kref.h>
++#include <linux/rwsem.h>
++#include <linux/workqueue.h>
+ #include <linux/completion.h>
+ #include <linux/dma-buf.h>
+ #include <linux/dma-mapping.h>
+@@ -568,6 +573,11 @@
+ };
+ 
+ struct nvgpu_device {
++  struct kref lifetime;
++  struct rw_semaphore transport_lifetime;
++  spinlock_t sync_lock;
++  struct list_head sync_fences;
++  bool stopping;
+   /*
+    * Where the VMM placed the window, read out of this device's own shared
+    * memory region. Zero-length when the VMM offers none, in which case device
+@@ -848,6 +858,8 @@
+   u32 owner_handle; /* backend handle of the drm_file owning the host object */
+   u32 host_handle;  /* the GEM handle in the host's drm_file */
+   u32 obj_type;     /* what GEM_IDENTIFY_OBJECT answers */
++  bool fence_context;
++  u64 sync_context;
+   /*
+    * Where the host's memory for this object sits in the shared window, and
+    * whether it has been put there yet. Placed on the first map and not before:
+@@ -868,10 +880,13 @@
+ 
+ /* Defined below; named here because the ioctls that test it come first. */
+ static const struct drm_gem_object_funcs nvgpu_gem_funcs;
++static void nvgpu_device_put(struct nvgpu_device *dev);
++static void nvgpu_sync_event(struct nvgpu_device *, struct nvgpu_event_buf *, unsigned int);
++static long nvgpu_sync_create(struct nvgpu_fd *, struct drm_file *, unsigned int, void __user *);
+ 
+ static int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *nfd,
+                                   u32 host_handle, size_t size,
+-                                  u32 *guest_handle);
++                                  u32 *guest_handle, bool fence_context);
+ static int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
+                              u32 *host_handle, u32 *owner_handle);
+ static long nvgpu_gem_identify(struct drm_file *file, void __user *uarg);
+@@ -1099,7 +1114,7 @@
+      */
+     info[3] = nvgpu_claim_alloc;   /* supports_alloc */
+     info[7] = nvgpu_claim_sync_fd; /* supports_sync_fd */
+-    info[8] = 0; /* Linux sync-file proxies are not implemented yet. */
++    info[8] = 0; /* Complete semaphore-surface contract is not qualified yet. */
+ 
+     /*
+      * primary_index is the number of the DRM node this device is, and it has
+@@ -1243,7 +1258,7 @@
+ 
+     /* The host's handle never reaches userspace; a proxy stands in for it. */
+     ret = nvgpu_gem_proxy_create(file, nfd, p.handle, p.memory_size,
+-                                 &guest_handle);
++                                 &guest_handle, false);
+     if (ret) {
+       struct nvgpu_drm_gem_close close = {.handle = p.handle};
+ 
+@@ -1264,6 +1279,9 @@
+    * backend gives them a host address before the call -- the same shape as
+    * nvidia-modeset, which is why both go through one forwarder.
+    */
++  case 0x15: /* SEMSURF_FENCE_CREATE: a real guest sync-file */
++    return nvgpu_sync_create(nfd, file, cmd, uarg);
++
+   case DRM_NVIDIA_SEMSURF_CONTEXT:
+     if (!file || !nvgpu_fence_probe)
+       return -EOPNOTSUPP;
+@@ -1397,7 +1415,7 @@
+  * nvgpu_send_recv — submit one request to controlq and block until the VMM
+  * returns the response, which is copied into `resp`.
+  */
+-static int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
++static int nvgpu_send_recv_active(struct nvgpu_device *dev, void *req, int req_len,
+                            void *resp, int resp_len) {
+   struct scatterlist sg_out, sg_in;
+   struct scatterlist *sgs[2] = {&sg_out, &sg_in};
+@@ -1449,6 +1467,15 @@
+   memcpy(resp, r->data + req_len, min_t(int, r->written, resp_len));
+   kfree(r);
+   return 0;
++}
++
++static int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
++                           void *resp, int resp_len) {
++  int ret;
++  down_read(&dev->transport_lifetime);
++  ret = dev->stopping ? -ENODEV : nvgpu_send_recv_active(dev, req, req_len, resp, resp_len);
++  up_read(&dev->transport_lifetime);
++  return ret;
+ }
+ 
+ /* Queue-owned flat requests: completion IRQ frees the token. Display errors
+@@ -1620,6 +1647,10 @@
+     drained = true;
+     if (len >= sizeof(buf->hdr) &&
+         le32_to_cpu(buf->hdr.msg_type) == NVGPU_MSG_EVENT_READY &&
++        le32_to_cpu(buf->hdr.padding) == 0x4c470002)
++      nvgpu_sync_event(dev, buf, len);
++    else if (len >= sizeof(buf->hdr) &&
++        le32_to_cpu(buf->hdr.msg_type) == NVGPU_MSG_EVENT_READY &&
+         le32_to_cpu(buf->hdr.padding) == 0x4c470001)
+       nvgpu_display_event_deliver(dev, buf, len);
+     else if (len >= sizeof(buf->hdr) &&
+@@ -3293,6 +3324,7 @@
+ 
+   nfd->handle = le32_to_cpu(resp->hdr.handle);
+   nvgpu_fd_register(nfd->dev, nfd);
++  kref_get(&dev->lifetime);
+   filp->private_data = nfd;
+   kfree(req);
+   kfree(resp);
+@@ -3334,6 +3366,7 @@
+   kfree(req);
+   kfree(resp);
+   nvgpu_fd_unregister(nfd->dev, nfd);
++  nvgpu_device_put(nfd->dev);
+   kfree(nfd);
+   return 0;
+ }
+@@ -3580,6 +3613,8 @@
+  * belongs to the drm_file that created it, and that file may well have closed
+  * first -- a compositor can outlive the client whose buffer it imported.
+  */
++#include "legion_sync_file.h"
++
+ static void nvgpu_gem_free(struct drm_gem_object *obj) {
+   struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
+ 
+@@ -3611,6 +3646,7 @@
+   }
+ 
+   drm_gem_object_release(obj);
++  nvgpu_device_put(ng->dev);
+   kfree(ng);
+ }
+ 
+@@ -3666,6 +3702,7 @@
+     return -ENOTSUPP;
+   }
+ 
++  if (ng->fence_context) return -EOPNOTSUPP;
+   mutex_lock(&ng->map_lock);
+   if (ng->window_valid) {
+     mutex_unlock(&ng->map_lock);
+@@ -3861,6 +3898,7 @@
+ 
+ static struct dma_buf *nvgpu_gem_export(struct drm_gem_object *obj, int flags) {
+   DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
++  if (to_nvgpu_gem(obj)->fence_context) return ERR_PTR(-EOPNOTSUPP);
+ 
+   exp_info.ops = &nvgpu_dmabuf_ops;
+   exp_info.size = obj->size;
+@@ -3938,7 +3976,7 @@
+  */
+ static int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *nfd,
+                                   u32 host_handle, size_t size,
+-                                  u32 *guest_handle) {
++                                  u32 *guest_handle, bool fence_context) {
+   struct nvgpu_gem_object *ng;
+   int ret;
+ 
+@@ -3956,9 +3994,14 @@
+   ng->dev = nfd->dev;
+   ng->owner_handle = nfd->handle;
+   ng->host_handle = host_handle;
+-  ng->obj_type = NVGPU_GEM_OBJECT_NVKMS;
++  ng->obj_type = fence_context ? NVGPU_GEM_OBJECT_UNKNOWN : NVGPU_GEM_OBJECT_NVKMS;
++  ng->fence_context = fence_context;
++  ng->sync_context = fence_context ? dma_fence_context_alloc(1) : 0;
++  kref_get(&ng->dev->lifetime);
+ 
+   ret = drm_gem_handle_create(file, &ng->base, guest_handle);
++  /* Until a guest handle exists the caller owns host rollback. */
++  if (ret) ng->host_handle = 0;
+   /* The handle holds the only reference now, or nothing does and it is freed. */
+   drm_gem_object_put(&ng->base);
+   return ret;
+@@ -4049,6 +4092,7 @@
+   int req_total, resp_max, ret;
+   u32 fwd_handle = nfd->handle;
+   u32 caller_handle = 0;
++  u32 context_rollback = 0;
+ 
+   /*
+    * The caller's struct has to be the one this descriptor describes, or the
+@@ -4194,7 +4238,7 @@
+           obj_size = get_unaligned_le64(out + d->size_field_offset);
+ 
+         cret = nvgpu_gem_proxy_create(file, nfd, host_handle, (size_t)obj_size,
+-                                      &guest_handle);
++                                      &guest_handle, d == &nvgpu_semsurf_context);
+         if (cret) {
+           struct nvgpu_drm_gem_close close = {.handle = host_handle};
+ 
+@@ -4204,17 +4248,21 @@
+           goto out;
+         }
+         put_unaligned_le32(guest_handle, out + d->handle_offset);
++        if (d == &nvgpu_semsurf_context) context_rollback = guest_handle;
+       } else {
+         /* The caller reads back the handle it passed, not the host's. */
+         put_unaligned_le32(caller_handle, out + d->handle_offset);
+       }
+     }
+ 
+-    if (copy_to_user(uarg, out, le32_to_cpu(resp->data_len)))
++    if (copy_to_user(uarg, out, le32_to_cpu(resp->data_len))) {
++      if (context_rollback) drm_gem_handle_delete(file, context_rollback);
+       ret = -EFAULT;
+-  }
+-
+-  if (user_nested && nested_size > 0 && le32_to_cpu(resp->nested_len) > 0) {
++    }
++  }
++
++  /* Semaphore import parameters are input-only, including read-only memory. */
++  if (d != &nvgpu_semsurf_context && user_nested && nested_size > 0 && le32_to_cpu(resp->nested_len) > 0) {
+     u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
+ 
+     if (copy_to_user(user_nested, resp_buf + sizeof(*resp) + d->size,
+@@ -4545,6 +4593,7 @@
+ 
+   nfd->handle = le32_to_cpu(resp->hdr.handle);
+   nvgpu_fd_register(nfd->dev, nfd);
++  kref_get(&dev->lifetime);
+   filp->private_data = nfd;
+   kfree(req);
+   kfree(resp);
+@@ -4617,6 +4666,7 @@
+ 
+   nfd->handle = le32_to_cpu(resp->hdr.handle);
+   nvgpu_fd_register(nfd->dev, nfd);
++  kref_get(&dev->lifetime);
+   file->driver_priv = nfd;
+   kfree(req);
+   kfree(resp);
+@@ -4646,6 +4696,7 @@
+   kfree(req);
+   kfree(resp);
+   nvgpu_fd_unregister(nfd->dev, nfd);
++  nvgpu_device_put(nfd->dev);
+   kfree(nfd);
+   file->driver_priv = NULL;
+ }
+@@ -4824,7 +4875,8 @@
+   switch (cmd) {
+   case 0xc0204c20: size = 32; break;
+   case 0xc0104c21: size = 16; break;
+-  case 0x40084c22: case 0x80084c23: size = 8; break;
++  case 0x40084c22: case 0x80084c23: case 0x40084c24: case 0x80084c25: size = 8; break;
++  case 0x80204c26: size = 32; break;
+   default: return -ENOTTY;
+   }
+   if ((_IOC_DIR(cmd) & _IOC_WRITE) && copy_from_user(data, (void __user *)arg, size))
+@@ -5822,11 +5874,18 @@
+   dev_t gpu_devno;
+   int ret, i;
+ 
+-  dev = devm_kzalloc(&vdev->dev, sizeof(*dev), GFP_KERNEL);
++  dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+   if (!dev)
+     return -ENOMEM;
+ 
+   dev->vdev = vdev;
++  get_device(&vdev->dev);
++  kref_init(&dev->lifetime);
++  init_rwsem(&dev->transport_lifetime);
++  spin_lock_init(&dev->sync_lock);
++  INIT_LIST_HEAD(&dev->sync_fences);
++  ret = devm_add_action_or_reset(&vdev->dev, nvgpu_device_put_action, dev);
++  if (ret) return ret;
+   vdev->priv = dev;
+   spin_lock_init(&dev->vq_lock);
+   spin_lock_init(&dev->display_event_lock);
+@@ -6116,6 +6175,7 @@
+   struct nvgpu_device *dev = vdev->priv;
+   int i;
+ 
++  nvgpu_sync_stop(dev);
+   vdev->config->reset(vdev);
+   /* After the reset: the queue is quiet, so the buffers cannot be in use. */
+   kfree(dev->event_bufs);
+@@ -6213,17 +6273,24 @@
+ 
+ static int __init nvgpu_init(void)
+ {
++    int ret;
++    nvgpu_sync_wq = alloc_workqueue("nvgpu-sync", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
++    if (!nvgpu_sync_wq) return -ENOMEM;
+     if (virtio_id != VIRTIO_ID_GPU_NV) {
+         id_table[0].device = virtio_id;
+         pr_info("virtio-gpu-nv: binding virtio device id %u (default %u)\n",
+                 virtio_id, (unsigned int)VIRTIO_ID_GPU_NV);
+     }
+-    return register_virtio_driver(&nvgpu_driver);
++    ret = register_virtio_driver(&nvgpu_driver);
++    if (ret) destroy_workqueue(nvgpu_sync_wq);
++    return ret;
+ }
+ 
+ static void __exit nvgpu_exit(void)
+ {
+     unregister_virtio_driver(&nvgpu_driver);
++    destroy_workqueue(nvgpu_sync_wq);
++    synchronize_rcu();
+ }
+ 
+ module_init(nvgpu_init);
+--- a/driver/Makefile
++++ b/driver/Makefile
+@@ -18,3 +18,12 @@
+ 
+ clean:
+ 	$(MAKE) -C $(KDIR) M=$(PWD) clean
++
++# Probe the supplied guest kernel headers, not its version number.
++ifneq ($(KERNELRELEASE),)
++ifneq ($(shell grep -c 'dma_fence_init64' $(srctree)/include/linux/dma-fence.h),0)
++ccflags-y += -DNVGPU_HAVE_FENCE_INIT64
++else ifneq ($(shell grep -c 'use_64bit_seqno' $(srctree)/include/linux/dma-fence.h),0)
++ccflags-y += -DNVGPU_HAVE_FENCE_OPS64
++endif
++endif

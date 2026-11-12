@@ -1,0 +1,37 @@
+[package]
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+name = "legion-workload-probe"
+version.workspace = true
+edition.workspace = true
+description = "Matched CPU execution, job dispatch and offscreen Vulkan workload probe"
+
+[features]
+default = []
+gpu = ["dep:ash", "dep:legion-cpu-topology"]
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rustix = { version = "1.1", features = ["time"] }
+legion-cpu-topology = { path = "../cpu-topology", optional = true }
+ash = { version = "0.38", optional = true }
+
+[[bin]]
+name = "legion-workload-probe"
+path = "src/main.rs"
+required-features = ["gpu"]
+
+[[bin]]
+name = "legion-sparse-probe"
+path = "src/sparse.rs"
+required-features = ["gpu"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"

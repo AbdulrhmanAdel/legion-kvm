@@ -1,0 +1,202 @@
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -253,6 +253,9 @@
+ 
+ struct VirtIOGPUGL {
+     struct VirtIOGPU parent_obj;
++
++    /* Explicit DRM context device, independent of the display renderer. */
++    char *drm_rendernode;
+ 
+     RenderState renderer_state;
+ 
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -164,6 +164,7 @@
+ }
+ 
+ static const Property virtio_gpu_gl_properties[] = {
++    DEFINE_PROP_STRING("drm-rendernode", VirtIOGPUGL, drm_rendernode),
+     DEFINE_PROP_BIT("stats", VirtIOGPU, parent_obj.conf.flags,
+                     VIRTIO_GPU_FLAG_STATS_ENABLED, false),
+     DEFINE_PROP_BIT("venus", VirtIOGPU, parent_obj.conf.flags,
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -1435,11 +1435,39 @@
+     return true;
+ }
+ 
++static int virgl_open_native_drm(void *cookie)
++{
++    VirtIOGPUGL *gl = VIRTIO_GPU_GL(cookie);
++
++    /* The renderer owns each returned descriptor, including per-context opens. */
++    return open(gl->drm_rendernode, O_RDWR | O_CLOEXEC);
++}
++
+ static int virtio_gpu_virgl_init(VirtIOGPU *g)
+ {
+     int ret;
+     uint32_t flags = 0;
+     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
++
++    if (gl->drm_rendernode) {
++        int fd;
++
++        if (!virtio_gpu_drm_enabled(g->parent_obj.conf)) {
++            error_report("drm-rendernode requires drm_native_context=on");
++            return -EINVAL;
++        }
++        fd = virgl_open_native_drm(g);
++        if (fd < 0) {
++            int error = errno;
++            error_report("cannot open DRM context device %s: %s",
++                         gl->drm_rendernode, strerror(error));
++            return -error;
++        }
++        close(fd);
++        virtio_gpu_3d_cbs.get_drm_fd = virgl_open_native_drm;
++    } else {
++        virtio_gpu_3d_cbs.get_drm_fd = NULL;
++    }
+ 
+ #if VIRGL_RENDERER_CALLBACKS_VERSION >= 4
+     if (qemu_egl_display) {
+--- a/hw/display/virtio-gpu-udmabuf.c
++++ b/hw/display/virtio-gpu-udmabuf.c
+@@ -206,7 +206,9 @@
+                                   &offset, &fb->stride,
+                                   r->x, r->y, fb->width, fb->height,
+                                   qemu_pixman_to_drm_format(fb->format),
+-                                  DRM_FORMAT_MOD_INVALID, &res->dmabuf_fd,
++                                  virtio_gpu_drm_enabled(g->parent_obj.conf) ?
++                                  DRM_FORMAT_MOD_LINEAR : DRM_FORMAT_MOD_INVALID,
++                                  &res->dmabuf_fd,
+                                   1, true, false);
+     dmabuf->scanout_id = scanout_id;
+     QTAILQ_INSERT_HEAD(&g->dmabuf.bufs, dmabuf, next);
+--- a/ui/egl-helpers.c
++++ b/ui/egl-helpers.c
+@@ -411,11 +411,12 @@
+ 
+     glGenTextures(1, &texture);
+     qemu_dmabuf_set_texture(dmabuf, texture);
+-    glBindTexture(GL_TEXTURE_2D, texture);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+-
+-    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
++    GLenum target = getenv("LEGION_SCANOUT_EXTERNAL") ? GL_TEXTURE_EXTERNAL_OES : GL_TEXTURE_2D;
++    glBindTexture(target, texture);
++    glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++    glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++
++    glEGLImageTargetTexture2DOES(target, (GLeglImageOES)image);
+     eglDestroyImageKHR(qemu_egl_display, image);
+ }
+ 
+--- a/ui/sdl2-gl.c
++++ b/ui/sdl2-gl.c
+@@ -240,7 +240,7 @@
+     if (!scon->scanout_mode) {
+         return;
+     }
+-    if (!scon->guest_fb.framebuffer) {
++    if (!scon->guest_fb.framebuffer && !getenv("LEGION_SCANOUT_EXTERNAL")) {
+         return;
+     }
+ 
+@@ -248,7 +248,16 @@
+ 
+     SDL_GetWindowSize(scon->real_window, &ww, &wh);
+     egl_fb_setup_default(&scon->win_fb, ww, wh, 0, 0);
+-    egl_fb_blit(&scon->win_fb, &scon->guest_fb, !scon->y0_top);
++    if (getenv("LEGION_SCANOUT_EXTERNAL")) {
++        glBindFramebuffer(GL_FRAMEBUFFER, 0);
++        glViewport(0, 0, ww, wh);
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_EXTERNAL_OES, scon->guest_fb.texture);
++        qemu_gl_run_external_blit(scon->gls, scon->y0_top);
++    } else {
++        egl_fb_blit(&scon->win_fb, &scon->guest_fb, !scon->y0_top);
++    }
++
+ 
+     SDL_GL_SwapWindow(scon->real_window);
+ }
+@@ -267,6 +276,15 @@
+     if (!qemu_dmabuf_get_texture(dmabuf)) {
+         fds = qemu_dmabuf_get_fds(dmabuf, NULL);
+         error_report("%s: failed fd=%d", __func__, fds ? fds[0] : -1);
++        return;
++    }
++
++    if (getenv("LEGION_SCANOUT_EXTERNAL")) {
++        scon->scanout_mode = true;
++        scon->guest_fb.texture = qemu_dmabuf_get_texture(dmabuf);
++        scon->guest_fb.width = qemu_dmabuf_get_width(dmabuf);
++        scon->guest_fb.height = qemu_dmabuf_get_height(dmabuf);
++        scon->y0_top = false;
+         return;
+     }
+ 
+--- a/ui/shader.c
++++ b/ui/shader.c
+@@ -36,6 +36,9 @@
+     GLint texture_blit_prog;
+     GLint texture_blit_flip_prog;
+     GLint texture_blit_vao;
++    GLint external_blit_prog;
++    GLint external_blit_flip_prog;
++    GLuint external_blit_vao;
+ };
+ 
+ /* ---------------------------------------------------------------------- */
+@@ -165,6 +168,21 @@
+     gls->texture_blit_vao =
+         qemu_gl_init_texture_blit(gls->texture_blit_prog);
+ 
++    if (getenv("LEGION_SCANOUT_EXTERNAL")) {
++        const char *frag = "#version 300 es\n"
++            "#extension GL_OES_EGL_image_external_essl3 : require\n"
++            "uniform samplerExternalOES image;\n"
++            "in mediump vec2 ex_tex_coord;\n"
++            "out mediump vec4 out_frag_color;\n"
++            "void main() { out_frag_color = texture(image, ex_tex_coord); }\n";
++        gls->external_blit_prog = qemu_gl_create_compile_link_program(texture_blit_vert_src, frag);
++        gls->external_blit_flip_prog = qemu_gl_create_compile_link_program(texture_blit_flip_vert_src, frag);
++        if (!gls->external_blit_prog || !gls->external_blit_flip_prog) {
++            exit(1);
++        }
++        gls->external_blit_vao = qemu_gl_init_texture_blit(gls->external_blit_prog);
++    }
++
+     return gls;
+ }
+ 
+@@ -176,5 +194,15 @@
+     glDeleteProgram(gls->texture_blit_prog);
+     glDeleteProgram(gls->texture_blit_flip_prog);
+     glDeleteProgram(gls->texture_blit_vao);
++    glDeleteProgram(gls->external_blit_prog);
++    glDeleteProgram(gls->external_blit_flip_prog);
++    glDeleteVertexArrays(1, &gls->external_blit_vao);
+     g_free(gls);
+ }
++
++void qemu_gl_run_external_blit(QemuGLShader *gls, bool flip)
++{
++    glUseProgram(flip ? gls->external_blit_flip_prog : gls->external_blit_prog);
++    glBindVertexArray(gls->external_blit_vao);
++    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++}
+--- a/include/ui/shader.h
++++ b/include/ui/shader.h
+@@ -4,6 +4,7 @@
+ typedef struct QemuGLShader QemuGLShader;
+ 
+ void qemu_gl_run_texture_blit(QemuGLShader *gls, bool flip);
++void qemu_gl_run_external_blit(QemuGLShader *gls, bool flip);
+ 
+ QemuGLShader *qemu_gl_init_shader(void);
+ void qemu_gl_fini_shader(QemuGLShader *gls);

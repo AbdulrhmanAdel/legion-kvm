@@ -1,0 +1,20 @@
+--- a/hw/virtio/vhost.c
++++ b/hw/virtio/vhost.c
+@@ -635,6 +635,17 @@
+ static bool vhost_section(struct vhost_dev *dev, MemoryRegionSection *section)
+ {
+     MemoryRegion *mr = section->mr;
++
++    /*
++     * VIRTIO shared memory mappings belong to a device BAR, not system RAM.
++     * Sending them back to vhost backends as guest RAM both exposes unrelated
++     * device mappings and exhausts the baseline memory-table region limit.
++     * KVM still receives these sections through its own memory listener.
++     */
++    if (mr->owner && object_dynamic_cast(mr->owner,
++                                        TYPE_VIRTIO_SHARED_MEMORY_MAPPING)) {
++        return false;
++    }
+ 
+     if (memory_region_is_ram(mr) && !memory_region_is_rom(mr)) {
+         uint8_t dirty_mask = memory_region_get_dirty_log_mask(mr);

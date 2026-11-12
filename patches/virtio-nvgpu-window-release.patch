@@ -1,0 +1,126 @@
+--- a/device/src/nvidia/mod.rs
++++ b/device/src/nvidia/mod.rs
+@@ -593,6 +593,15 @@
+         self.shm.free_bytes()
+     }
+ 
++    fn release_mapped_region(&mut self, region: &crate::shm::ShmRegion) -> Result<()> {
++        // An external VMM owns a separate mapping. It must acknowledge its
++        // removal before this offset can be allocated to another object.
++        if let Some(window) = self.window.as_ref() {
++            window.withdraw(region.offset, region.length)?;
++        }
++        self.shm.free(region)
++    }
++
+     pub fn shm_base_ptr(&self) -> *mut u8 {
+         self.shm.base_ptr()
+     }
+@@ -765,7 +774,7 @@
+             .map(|e| e.region)
+             .collect();
+         for region in leftovers {
+-            if let Err(e) = self.shm.free(&region) {
++            if let Err(e) = self.release_mapped_region(&region) {
+                 log::warn!(
+                     "teardown: SHM free of {:#x}+{:#x} failed: {}",
+                     region.offset,
+--- a/device/src/nvidia/open.rs
++++ b/device/src/nvidia/open.rs
+@@ -99,8 +99,11 @@
+                 entry.region.offset,
+                 entry.region.length
+             );
+-            if let Err(e) = self.shm.free(&entry.region) {
++            if let Err(e) = self.release_mapped_region(&entry.region) {
+                 log::warn!("close handle={handle}: SHM free failed: {e}");
++                // Quarantine the extent for teardown rather than reuse a
++                // range the VMM may still have mapped.
++                self.active_maps.insert(entry.region.offset, entry);
+             }
+         }
+ 
+--- a/device/src/nvidia/rm_fd.rs
++++ b/device/src/nvidia/rm_fd.rs
+@@ -434,8 +434,9 @@
+         if status == 0 {
+             // Host unmap succeeded -- restore the SHM backing and return the
+             // extent to its zone, so the space can serve a later mapping.
+-            if let Err(e) = self.shm.free(&entry.region) {
++            if let Err(e) = self.release_mapped_region(&entry.region) {
+                 log::warn!("UNMAP_MEMORY: SHM free failed: {} (non-fatal)", e);
++                self.active_maps.insert(guest_linear, entry);
+             }
+         } else {
+             // Host returned RM error — put the entry back
+--- a/device/src/nvidia/tests.rs
++++ b/device/src/nvidia/tests.rs
+@@ -1,6 +1,57 @@
+ //! Unit tests for the backend. Those that need /dev/nvidiactl skip without it.
+ 
+ use super::*;
++
++#[cfg(test)]
++mod transport_release_tests {
++    use super::*;
++    use std::sync::{Arc, Mutex};
++
++    struct Window {
++        calls: Arc<Mutex<Vec<(u64, u64)>>>,
++        fail: bool,
++    }
++
++    impl crate::shm::WindowPlacer for Window {
++        fn place(&self, _: u64, _: u64, _: RawFd, _: u64, _: bool) -> Result<()> {
++            Ok(())
++        }
++
++        fn withdraw(&self, offset: u64, len: u64) -> Result<()> {
++            self.calls.lock().expect("test window lock").push((offset, len));
++            if self.fail {
++                return Err(std::io::Error::other("test transport failure").into());
++            }
++            Ok(())
++        }
++    }
++
++    #[test]
++    fn transport_release_notifies_vmm_before_reusing_an_extent() {
++        let mut backend = NvidiaBackend::for_test();
++        let before = backend.shm_free_bytes();
++        let calls = Arc::new(Mutex::new(Vec::new()));
++        backend.set_window(Box::new(Window { calls: calls.clone(), fail: false }));
++        let region = backend.shm.alloc(4096, crate::shm::PgprotKind::WriteCombine).expect("allocate test region");
++        backend.release_mapped_region(&region).expect("release mapping");
++        assert_eq!(*calls.lock().expect("test window lock"), [(region.offset, region.length)]);
++        assert_eq!(backend.shm_free_bytes(), before);
++        let reused = backend.shm.alloc(4096, crate::shm::PgprotKind::WriteCombine).expect("reuse test region");
++        assert_eq!(reused.offset, region.offset);
++    }
++
++    #[test]
++    fn transport_release_failure_keeps_the_extent_reserved() {
++        let mut backend = NvidiaBackend::for_test();
++        backend.set_window(Box::new(Window { calls: Arc::new(Mutex::new(Vec::new())), fail: true }));
++        let region = backend.shm.alloc(4096, crate::shm::PgprotKind::WriteCombine).expect("allocate test region");
++        let reserved = backend.shm_free_bytes();
++        assert!(backend.release_mapped_region(&region).is_err());
++        assert_eq!(backend.shm_free_bytes(), reserved);
++        let next = backend.shm.alloc(4096, crate::shm::PgprotKind::WriteCombine).expect("allocate another region");
++        assert_ne!(next.offset, region.offset);
++    }
++}
+ 
+ #[cfg(test)]
+ mod abi_tests {
+@@ -1107,7 +1158,9 @@
+             Ok(())
+         }
+         fn withdraw(&self, _: u64, _: u64) -> crate::error::Result<()> {
+-            unreachable!("RM unmap restores the allocator's backing directly")
++            // This in-process window aliases the allocator's own mapping;
++            // ShmAllocator::free restores that backing after this callback.
++            Ok(())
+         }
+     }
+ 

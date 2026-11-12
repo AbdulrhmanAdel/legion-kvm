@@ -1,0 +1,56 @@
+[package]
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+name = "legion-kvm"
+version.workspace = true
+edition.workspace = true
+description = "Linux KVM application launcher"
+
+[[bin]]
+name = "legion"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+ruzstd = "0.9.1"
+tempfile = "3"
+rustix = { version = "1.1", features = ["process", "fs", "thread"] }
+legion-display-channel = { path = "crates/display-channel" }
+legion-cpu-topology = { path = "crates/cpu-topology" }
+legion-kvm-capabilities = { path = "crates/kvm-capabilities" }
+legion-shared-directories = { path = "crates/shared-directories" }
+legion-workload-probe = { path = "crates/workload-probe" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+
+
+[workspace]
+resolver = "2"
+members = [".", "crates/cpu-adapter", "crates/cpu-contract", "crates/cpu-topology", "crates/display-channel", "crates/display-probe", "crates/gpu-presenter", "crates/guest-compositor", "crates/guest-probe", "crates/kvm-capabilities", "crates/proton-workload", "crates/shared-directories", "crates/workload-probe"]
+default-members = ["."]
+exclude = ["backends/nvidia"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "AGPL-3.0-only"
+repository = "https://github.com/brcly/legion-kvm"
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+strip = "symbols"
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"

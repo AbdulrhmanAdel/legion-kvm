@@ -1,0 +1,20 @@
+--- a/driver/virtio_gpu_nv.c
++++ b/driver/virtio_gpu_nv.c
+@@ -883,6 +883,7 @@
+ static void nvgpu_device_put(struct nvgpu_device *dev);
+ static void nvgpu_sync_event(struct nvgpu_device *, struct nvgpu_event_buf *, unsigned int);
+ static long nvgpu_sync_create(struct nvgpu_fd *, struct drm_file *, unsigned int, void __user *);
++static long nvgpu_sync_attach(struct nvgpu_fd *, struct drm_file *, unsigned int, void __user *);
+ static long nvgpu_sync_wait(struct nvgpu_fd *, struct drm_file *, unsigned int, void __user *);
+ 
+ static int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *nfd,
+@@ -1286,6 +1287,9 @@
+   case 0x16: /* SEMSURF_FENCE_WAIT: scoped bridge-owned input fence */
+     return nvgpu_sync_wait(nfd, file, cmd, uarg);
+ 
++  case 0x17: /* SEMSURF_FENCE_ATTACH: native and guest buffer reservations */
++    return nvgpu_sync_attach(nfd, file, cmd, uarg);
++
+   case DRM_NVIDIA_SEMSURF_CONTEXT:
+     if (!file || !nvgpu_fence_probe)
+       return -EOPNOTSUPP;

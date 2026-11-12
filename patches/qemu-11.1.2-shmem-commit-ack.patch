@@ -1,0 +1,47 @@
+--- a/hw/virtio/vhost-user.c
++++ b/hw/virtio/vhost-user.c
+@@ -2001,18 +2001,9 @@
+     }
+ 
+ send_reply_commit:
+-    /* Send reply and commit after transaction started */
+-    if (hdr->flags & VHOST_USER_NEED_REPLY_MASK) {
+-        payload->u64 = !!ret;
+-        hdr->size = sizeof(payload->u64);
+-        if (!vhost_user_send_resp(ioc, hdr, payload, &local_err)) {
+-            error_report_err(local_err);
+-            memory_region_transaction_commit();
+-            return -EFAULT;
+-        }
+-    }
++    /* Complete KVM mapping installation before reporting success. */
+     memory_region_transaction_commit();
+-    return 0;
++    goto send_reply;
+ 
+ send_reply:
+     if (hdr->flags & VHOST_USER_NEED_REPLY_MASK) {
+@@ -2086,6 +2077,11 @@
+     }
+ 
+ send_reply:
++    if (!ret && shmem && mmap) {
++        /* Complete removal before allowing the backend to reuse the range. */
++        virtio_del_shmem_map(shmem, vu_mmap->shm_offset, vu_mmap->len);
++    }
++
+     if (hdr->flags & VHOST_USER_NEED_REPLY_MASK) {
+         payload->u64 = !!ret;
+         hdr->size = sizeof(payload->u64);
+@@ -2093,11 +2089,6 @@
+             error_report_err(local_err);
+             return -EFAULT;
+         }
+-    }
+-
+-    if (!ret && shmem && mmap) {
+-        /* Free the MemoryRegion only after reply */
+-        virtio_del_shmem_map(shmem, vu_mmap->shm_offset, vu_mmap->len);
+     }
+ 
+     return 0;
