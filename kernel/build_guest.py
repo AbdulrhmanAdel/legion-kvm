@@ -30,7 +30,7 @@ def build(source, output, jobs, native_display=False):
         subprocess.run([*command, 'allnoconfig'], env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
     config = dict(line.split('=', 1) for line in (output/'.config').read_text().splitlines()
                   if line.startswith('CONFIG_') and '=' in line)
-    required = ('64BIT','X86_64','SMP','CPU_SUP_INTEL','CPU_SUP_AMD','KVM_GUEST',
+    required = ('64BIT','X86_64','SMP','CPU_SUP_INTEL','CPU_SUP_AMD','KVM_GUEST','MTRR','X86_PAT',
                 'IA32_EMULATION','COMPAT_32BIT_TIME','RSEQ','NUMA','FUSE_FS','VIRTIO_FS','VIRTIO_PCI','DRM',
                 'SND_HDA_INTEL','SND_PROC_FS','SND_PCM_TIMER','SND_TIMER','USER_NS','SECCOMP_FILTER','BPF_JIT','KPROBES','KALLSYMS','BASIC_MODVERSIONS',
                 'SHMEM','TMPFS','MEMFD_CREATE','FILE_LOCKING','PROC_FS','SYSFS','DEVTMPFS')

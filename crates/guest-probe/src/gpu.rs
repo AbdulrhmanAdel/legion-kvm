@@ -497,8 +497,20 @@ fn run_vulkan_program(program: &str, args: &[&str], name: &str) -> Result<Value>
         File::open(path)?.take(64 * 1024).read_to_end(&mut bytes)?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     };
+    let kernel_messages = if status.signal().is_some() {
+        let mut bytes = vec![0_u8; 64 * 1024];
+        // SAFETY: SYSLOG_ACTION_READ_ALL writes at most the allocated buffer length.
+        let length = unsafe { libc::klogctl(3, bytes.as_mut_ptr().cast(), 65536) };
+        if length > 0 {
+            String::from_utf8_lossy(&bytes[..length as usize]).into_owned()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
     Ok(
-        json!({"success": status.success(), "exit_code": status.code(), "signal": status.signal(), "stdout": read(&stdout)?, "stderr": read(&stderr)?}),
+        json!({"success": status.success(), "exit_code": status.code(), "signal": status.signal(), "stdout": read(&stdout)?, "stderr": read(&stderr)?, "kernel_messages": kernel_messages}),
     )
 }
 

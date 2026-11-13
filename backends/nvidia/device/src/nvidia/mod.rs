@@ -461,16 +461,6 @@ impl NvidiaBackend {
         self.shm.set_base_ptr(ptr);
     }
 
-    /// Create a minimal backend suitable for unit tests (8-page total BAR).
-    #[cfg(test)]
-    pub fn for_test() -> Self {
-        Self::new(ZoneConfig {
-            uc_size: 4096 * 2,
-            wc_size: 4096 * 4,
-            wb_size: 4096 * 2,
-        })
-    }
-
     // ------------------------------------------------------------------ Teardown Called by the VMM on: - normal VM shutdown (virtio device reset before exit) - ungraceful VM exit (SIGKILL, crash, libkrun teardown) Draining the handle table closes every host fd, which triggers the host NVIDIA driver's fd-release path and frees all RM objects.
 
     pub fn teardown(&mut self) {
@@ -719,4 +709,5 @@ mod vidmem;
 mod window;
 
 #[cfg(test)]
+#[path = "../../tests/unit/nvidia/backend.rs"]
 mod tests;

@@ -264,8 +264,8 @@ impl XwmHandler for State {
                 match i32::try_from(size).ok().filter(|v| *v > 0 && *v <= 16384) {
                     Some(value) => *dimension = value,
                     None => {
-                        self.error = Some("invalid X11 window dimensions".into());
-                        return;
+                        // Keep the current size during transient client reconfiguration.
+                        *dimension = (*dimension).clamp(1, 16384);
                     }
                 }
             }

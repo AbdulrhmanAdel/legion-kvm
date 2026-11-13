@@ -2654,3 +2654,14 @@ mod cases {
         assert!(be.set_vram_limit_mib(Some(100)).is_ok());
     }
 }
+
+impl NvidiaBackend {
+    /// Create a minimal backend suitable for unit tests (8-page total BAR).
+    pub fn for_test() -> Self {
+        Self::new(ZoneConfig {
+            uc_size: 4096 * 2,
+            wc_size: 4096 * 4,
+            wb_size: 4096 * 2,
+        })
+    }
+}

@@ -162,7 +162,7 @@ impl Scanout {
         let (width, height) = self.mode.size();
         ensure!(
             dma.size().w == i32::from(width) && dma.size().h == i32::from(height),
-            "scanout requires a full-size image: {:?}",
+            "scanout image {:?} does not match the display mode {width}x{height}",
             dma.size()
         );
         ensure!(
@@ -251,6 +251,11 @@ pub(crate) fn run() -> Result<()> {
         serde_json::from_slice(&fs::read("/frames/kms-presentation.json")?)?;
     let external = settings["client"] == "external";
     let application = external && settings["application"] == true;
+    let seconds = settings["seconds"].as_u64().unwrap_or(15);
+    ensure!(
+        external || (5..=30).contains(&seconds),
+        "invalid graphics check duration"
+    );
     ensure!(
         settings["schema"] == 1 && (external || settings["client"] == "cube"),
         "unsupported KMS presentation fixture configuration"
@@ -316,6 +321,7 @@ pub(crate) fn run() -> Result<()> {
                 )
                 .env("LEGION_CUBE_REPORT", "/frames/cube-result.json")
                 .env("VK_LOADER_LAYERS_DISABLE", "~implicit~")
+                .envs((settings["trace_protocol"] == true).then_some(("WAYLAND_DEBUG", "client")))
                 .stdin(Stdio::null())
                 .stdout(client_log.try_clone()?)
                 .stderr(client_log)
@@ -326,7 +332,8 @@ pub(crate) fn run() -> Result<()> {
     let mut clients = Vec::new();
     loop {
         ensure!(
-            application || start.elapsed() < Duration::from_secs(if external { 60 } else { 25 }),
+            application
+                || start.elapsed() < Duration::from_secs(if external { 60 } else { seconds + 10 }),
             "KMS presentation fixture timed out"
         );
         while let Some(stream) = listener.accept()? {
@@ -346,18 +353,18 @@ pub(crate) fn run() -> Result<()> {
             }
         }
         if scanout.complete()? {
-            if scanout.frames == 1 {
-                fs::write(
-                    "/frames/kms-first-frame.json",
-                    b"{\"schema\":1,\"presented\":true}\n",
-                )?;
-            }
             state.send_callbacks(u32::try_from(start.elapsed().as_millis())?);
         }
         if scanout.queued.is_none()
             && let Some(buffer) = state.pending.take()
         {
             scanout.submit(buffer)?;
+            if scanout.frames == 1 {
+                fs::write(
+                    "/frames/kms-first-frame.json",
+                    b"{\"schema\":1,\"presented\":true}\n",
+                )?;
+            }
         }
         state.send_callbacks(u32::try_from(start.elapsed().as_millis())?);
         display.flush_clients()?;
@@ -375,6 +382,9 @@ pub(crate) fn run() -> Result<()> {
             break;
         }
         if external && std::path::Path::new("/frames/proton-client-exited").is_file() {
+            break;
+        }
+        if !external && start.elapsed() >= Duration::from_secs(seconds) {
             break;
         }
         std::thread::sleep(Duration::from_micros(200));

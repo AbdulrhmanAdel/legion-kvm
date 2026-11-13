@@ -56,12 +56,12 @@ path = "bin/nvgpu-userspace.rs"
 
 [[bin]]
 name = "nvgpu-sandbox-selftest"
-path = "bin/nvgpu-sandbox-selftest.rs"
+path = "tests/support/nvgpu-sandbox-selftest.rs"
 
 [[bin]]
 name = "test-harness"
-path = "bin/test-harness.rs"
+path = "tests/support/test-harness.rs"
 
 [[bin]]
 name = "test-client"
-path = "bin/test_client.rs"
+path = "tests/support/test_client.rs"

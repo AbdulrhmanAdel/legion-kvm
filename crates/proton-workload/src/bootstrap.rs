@@ -62,6 +62,12 @@ mod linux {
         #[serde(default)]
         display_backend: DisplayBackend,
         #[serde(default)]
+        forward_wait: ForwardWait,
+        #[serde(default)]
+        explicit_sync: bool,
+        #[serde(default = "default_forward_idle_retry_us")]
+        forward_idle_retry_us: u64,
+        #[serde(default)]
         mangohud: bool,
         #[serde(default = "default_mangohud_config")]
         mangohud_config: String,
@@ -98,6 +104,18 @@ mod linux {
         #[serde(default)]
         present_cpu_profile: bool,
         #[serde(default)]
+        queue_cpu_profile: bool,
+        #[serde(default)]
+        queue_endpoint_profile: bool,
+        #[serde(default)]
+        queue_latency_profile: Option<QueueLatency>,
+        #[serde(default)]
+        queue_cycle_profile: bool,
+        #[serde(default)]
+        queue_profile_include_kernel: bool,
+        #[serde(default)]
+        synchronization_trace: bool,
+        #[serde(default)]
         native_forward: bool,
         #[serde(default)]
         driver_yield: Option<DriverYield>,
@@ -107,6 +125,10 @@ mod linux {
         syscall_counts: bool,
         #[serde(default)]
         guest_wakeups: Option<GuestWakeups>,
+        #[serde(default)]
+        driver_poll_spin_us: u32,
+        #[serde(default)]
+        driver_rpc_spin_us: Option<u32>,
         #[serde(default)]
         queue_placement: Option<QueuePlacement>,
         #[serde(default)]
@@ -150,11 +172,41 @@ mod linux {
         Xwayland,
     }
 
+    #[derive(Clone, Copy, Default, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum ForwardWait {
+        #[default]
+        Spin,
+        Events,
+        Hybrid,
+    }
+
+    impl ForwardWait {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Spin => "spin",
+                Self::Events => "events",
+                Self::Hybrid => "hybrid",
+            }
+        }
+    }
+
+    fn default_forward_idle_retry_us() -> u64 {
+        1000
+    }
+
     fn default_mangohud_config() -> String {
         "fps,frametime,frame_timing,cpu_stats,ram,resolution,gpu_stats=0,position=top-left".into()
     }
     fn nvidia_features_default() -> bool {
         true
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct QueueLatency {
+        opcode: u32,
+        stride: u32,
     }
 
     #[derive(Deserialize)]
@@ -200,6 +252,16 @@ mod linux {
 
     struct OwnedServer(Child);
     fn clock_environment() -> serde_json::Value {
+        use std::os::unix::fs::FileExt;
+        let msr = |offset| {
+            let mut bytes = [0; 8];
+            match fs::File::open("/dev/cpu/0/msr")
+                .and_then(|file| file.read_exact_at(&mut bytes, offset))
+            {
+                Ok(()) => serde_json::json!({"value":u64::from_le_bytes(bytes)}),
+                Err(error) => serde_json::json!({"unavailable":error.to_string()}),
+            }
+        };
         let read = |name| {
             fs::read_to_string(format!(
                 "/sys/devices/system/clocksource/clocksource0/{name}"
@@ -214,7 +276,8 @@ mod linux {
         };
         #[cfg(not(target_arch = "x86_64"))]
         let kvm_features: Option<u32> = None;
-        serde_json::json!({"schema":1,"current_clocksource":read("current_clocksource"),"available_clocksource":read("available_clocksource"),"hypervisor_feature_leaf_eax":kvm_features})
+        serde_json::json!({"schema":1,"current_clocksource":read("current_clocksource"),"available_clocksource":read("available_clocksource"),"hypervisor_feature_leaf_eax":kvm_features,
+            "mtrr_def_type":msr(0x2ff),"pat":msr(0x277),"mtrr_ranges":fs::read_to_string("/proc/mtrr").ok()})
     }
     impl Drop for OwnedServer {
         fn drop(&mut self) {
@@ -479,7 +542,9 @@ mod linux {
         };
         ensure!(
             rc == 0,
-            "guest bind mount failed: {}",
+            "guest bind mount {} to {} failed: {}",
+            source.to_string_lossy(),
+            target.to_string_lossy(),
             std::io::Error::last_os_error()
         );
         Ok(())
@@ -697,6 +762,46 @@ mod linux {
                 "mount setup is restricted to the disposable Legion guest"
             );
             prepare_guest_file_limits()?;
+            if let Some(spin_us) = launch.driver_rpc_spin_us {
+                ensure!(
+                    spin_us <= 100,
+                    "driver request polling exceeds 100 microseconds"
+                );
+                let path = "/sys/module/virtio_gpu_nv/parameters/rpc_spin_us";
+                let before = fs::read_to_string(path)?;
+                fs::write(path, spin_us.to_string())?;
+                let after = fs::read_to_string(path)?;
+                ensure!(
+                    after.trim().parse::<u32>()? == spin_us,
+                    "driver request polling setting did not match"
+                );
+                fs::write(
+                    "/frames/driver-rpc-control.json",
+                    serde_json::to_vec_pretty(
+                        &serde_json::json!({"before":before,"after":after,"guest_only":true,"host_changed":false}),
+                    )?,
+                )?;
+            }
+            if launch.driver_poll_spin_us != 0 {
+                ensure!(
+                    launch.driver_poll_spin_us <= 100,
+                    "driver polling exceeds 100 microseconds"
+                );
+                let path = "/sys/module/virtio_gpu_nv/parameters/poll_spin_us";
+                let before = fs::read_to_string(path)?;
+                fs::write(path, launch.driver_poll_spin_us.to_string())?;
+                let after = fs::read_to_string(path)?;
+                ensure!(
+                    after.trim().parse::<u32>()? == launch.driver_poll_spin_us,
+                    "driver polling setting did not match"
+                );
+                fs::write(
+                    "/frames/driver-poll-control.json",
+                    serde_json::to_vec_pretty(
+                        &serde_json::json!({"before":before,"after":after,"guest_only":true,"host_changed":false}),
+                    )?,
+                )?;
+            }
             if let Some(paths) = &launch.host_paths {
                 host_alias("/run/legion-shares/proton-home", &paths.home)?;
                 host_alias("/run/legion-shares/application", &paths.application)?;
@@ -735,6 +840,10 @@ mod linux {
                 bind("/usr/share/legion-proton", &launch.proton_path)?;
             }
             fs::create_dir_all("/etc")?;
+            if Path::new("/usr/etc/fonts").is_dir() {
+                fs::create_dir_all("/etc/fonts")?;
+                bind("/usr/etc/fonts", "/etc/fonts")?;
+            }
             for name in ["passwd", "group", "nsswitch.conf", "hosts", "machine-id"] {
                 fs::copy(
                     Path::new("/usr/share/legion/etc").join(name),
@@ -1045,6 +1154,20 @@ mod linux {
         if !native && parsed.diagnostic_event_trace {
             enable_guest_trace()?;
         }
+        if launch.synchronization_trace {
+            ensure!(
+                !native && windowed,
+                "synchronization tracing requires the guest window fixture"
+            );
+            enable_guest_trace()?;
+            for event in [
+                "syscalls/sys_enter_membarrier",
+                "ipi/ipi_send_cpu",
+                "ipi/ipi_send_cpumask",
+            ] {
+                fs::write(format!("/sys/kernel/tracing/events/{event}/enable"), "1")?;
+            }
+        }
         fs::write("/frames/fixture-config.json", config)?;
         match fs::remove_file("/frames/workload-result.json") {
             Ok(()) => {}
@@ -1100,6 +1223,9 @@ mod linux {
                         "schema":1,"external_client":true,"width":parsed.width,"height":parsed.height,
                         "seconds":presentation.seconds,"uncapped":true,"acquire_mode":"async",
                         "frame_transport":"polled","frame_pacing":"callbacks",
+                        "forward_wait":launch.forward_wait.as_str(),
+                        "explicit_sync":launch.explicit_sync,
+                        "forward_idle_retry_us":launch.forward_idle_retry_us,
                         "xwayland":use_xwayland,"application_client":launch.application.is_some()
                         ,"diagnostic_frames":launch.thread_snapshots,
                         "live_telemetry":launch.presentation_telemetry
@@ -1489,7 +1615,12 @@ mod linux {
                             || key.starts_with("VKD3D_")
                             || matches!(
                                 key.as_str(),
-                                "SteamAppId" | "SteamGameId" | "WINEDEBUG" | "LANG" | "LC_ALL"
+                                "SteamAppId"
+                                    | "SteamGameId"
+                                    | "WINEDEBUG"
+                                    | "LANG"
+                                    | "LC_ALL"
+                                    | "LEGION_WORKLOAD_DIRECTORY"
                             )),
                     "unsupported forwarded game environment variable"
                 );
@@ -1549,6 +1680,39 @@ mod linux {
                 command
                     .env("LD_PRELOAD", crate::cpu_adapter_control::LIBRARY)
                     .env("LEGION_CPU_ADAPTER", "1");
+            }
+            if let Some(profile) = &launch.queue_latency_profile
+                && phase == "workload"
+            {
+                ensure!(
+                    windowed
+                        && !native
+                        && launch.application.is_none()
+                        && launch.queue_placement.is_none()
+                        && !launch.queue_cpu_profile
+                        && !launch.queue_endpoint_profile
+                        && !launch.syscall_counts,
+                    "queue latency requires the owned guest fixture without other samplers"
+                );
+                let library = "/usr/share/legion/liblegion_queue_latency_probe.so";
+                ensure!(
+                    Path::new(library).is_file(),
+                    "queue latency observer is missing"
+                );
+                super::cpu_profile::CpuProfile::prepare_queue_latency(
+                    profile.opcode,
+                    profile.stride,
+                    launch.uid,
+                    launch.gid,
+                )?;
+                let preload = if launch.cpu_adapter {
+                    format!("{library}:{}", crate::cpu_adapter_control::LIBRARY)
+                } else {
+                    library.into()
+                };
+                command
+                    .env("LD_PRELOAD", preload)
+                    .env("LEGION_QUEUE_LATENCY_PATH", "/frames/queue-latency.bin");
             }
             if launch.thread_exit_trace && phase == "workload" {
                 command.env("LEGION_EXIT_DIAGNOSTICS", "1");
@@ -1691,13 +1855,11 @@ mod linux {
                     ))?;
                 }
             }
-            let profile = if let Some(mode) = &launch.queue_placement {
+            let profile = if launch.queue_latency_profile.is_some() && phase == "workload" {
+                Some(super::cpu_profile::CpuProfile::start_queue_latency()?)
+            } else if let Some(mode) = &launch.queue_placement {
                 ensure!(
-                    windowed
-                        && !native
-                        && launch.call_probe
-                        && !launch.syscall_counts
-                        && !launch.present_cpu_profile,
+                    windowed && !native && !launch.syscall_counts && !launch.present_cpu_profile,
                     "queue placement requires the owned guest and call marker without sampling"
                 );
                 if phase == "workload" {
@@ -1716,10 +1878,28 @@ mod linux {
                 }
             } else if launch.syscall_counts && phase == "workload" {
                 ensure!(
-                    windowed && !native && launch.call_probe && !launch.present_cpu_profile,
-                    "syscall counts require the owned VM fixture and call marker without CPU sampling"
+                    windowed
+                        && !native
+                        && launch.application.is_none()
+                        && !launch.present_cpu_profile,
+                    "syscall counts require the owned VM fixture without CPU sampling"
                 );
                 Some(super::cpu_profile::CpuProfile::start_syscalls()?)
+            } else if launch.queue_endpoint_profile && phase == "workload" {
+                ensure!(
+                    windowed && !native && launch.application.is_none(),
+                    "endpoint profiling requires the owned guest fixture"
+                );
+                Some(super::cpu_profile::CpuProfile::start_queue_endpoints()?)
+            } else if launch.queue_cpu_profile && phase == "workload" {
+                ensure!(
+                    windowed && !native && launch.application.is_none(),
+                    "queue worker profiling requires the owned guest fixture"
+                );
+                Some(super::cpu_profile::CpuProfile::start_queue_worker(
+                    launch.queue_cycle_profile,
+                    launch.queue_profile_include_kernel,
+                )?)
             } else if launch.present_cpu_profile && phase == "workload" {
                 ensure!(
                     windowed && launch.call_probe,
@@ -1752,6 +1932,13 @@ mod linux {
             let status = child
                 .wait()
                 .with_context(|| format!("run Proton {phase}"))?;
+            if launch.synchronization_trace && phase == "workload" {
+                fs::write("/sys/kernel/tracing/tracing_on", "0")?;
+                fs::write(
+                    "/frames/synchronization-guest.trace",
+                    fs::read("/sys/kernel/tracing/trace")?,
+                )?;
+            }
             if windowed && !native && phase == "workload" {
                 fs::write(
                     "/frames/interrupts-after.txt",

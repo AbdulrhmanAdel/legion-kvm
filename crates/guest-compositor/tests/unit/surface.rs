@@ -423,6 +423,34 @@ fn exercise_window_selection(gpu_only: bool) {
         }
         std::thread::sleep(Duration::from_millis(1));
     };
+    use smithay::wayland::{
+        compositor::{TraversalAction, with_surface_tree_downward},
+        shell::xdg::XdgShellHandler,
+    };
+    let roots = state
+        .xdg_shell_state()
+        .toplevel_surfaces()
+        .iter()
+        .map(|surface| surface.wl_surface().clone())
+        .collect::<Vec<_>>();
+    let mut checked = 0;
+    for root in roots {
+        with_surface_tree_downward(
+            &root,
+            (),
+            |_, _, _| TraversalAction::DoChildren(()),
+            |_, states, _| {
+                assert!(
+                    crate::syncobj::take_release(states)
+                        .expect("locked tree timeline state")
+                        .is_none()
+                );
+                checked += 1;
+            },
+            |_, _, _| true,
+        );
+    }
+    assert!(checked >= 3);
     let _ = finish.send(());
     let _ = shutdown.shutdown(std::net::Shutdown::Both);
     worker.join().expect("owned client thread");

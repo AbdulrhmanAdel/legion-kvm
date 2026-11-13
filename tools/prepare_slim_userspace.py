@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare an NVIDIA guest baseline from ELF dependencies, not a whole /usr."""
+"""Prepare guest userspace from application and runtime dependencies."""
 import argparse
 from collections import deque
 import json
@@ -11,7 +11,7 @@ import shutil
 import subprocess
 
 
-BINARIES = '''sh bash dash env python3 python3.13 vulkaninfo Xwayland xauth xkbcomp
+BINARIES = '''sh bash dash env python3 python3.13 vulkaninfo vkcube Xwayland xauth xkbcomp
 cat cp mv mkdir chmod ln readlink rm rmdir sed grep egrep fgrep cut tr head tail
 uname realpath which locale localedef id ls find sort dirname basename stat wc
 touch expr printf true false getent getconf ldd ldconfig tar gzip xz xrandr
@@ -192,7 +192,7 @@ class Baseline:
                 self.library(name, architecture, external=provider is not None, provider=provider)
 
 
-def prepare(source, output, protons):
+def prepare(source, output, protons, programs=()):
     source = source.resolve(strict=True)
     if not (source/'bin/vulkaninfo').is_file():
         raise ValueError('a qualified guest baseline is required')
@@ -202,6 +202,7 @@ def prepare(source, output, protons):
     output = output.resolve()
     output.mkdir(mode=0o700)
     baseline = Baseline(source, output)
+    baseline.queue.extend(Path(program).resolve(strict=True) for program in programs)
     for proton in protons:
         baseline.inspect_proton(proton.resolve(strict=True))
     for name in BINARIES:
@@ -209,6 +210,8 @@ def prepare(source, output, protons):
     for name in LIBRARIES:
         baseline.library(name, 2, required=name in X11_LIBRARIES or name in
                          ('libgbm.so.1', 'libdrm.so.2', 'libnvidia-egl-gbm.so.1'))
+    for name in ('libfreetype.so.6', 'libfontconfig.so.1'):
+        baseline.library(name, 1)
     for relative in DATA:
         baseline.include(relative)
     for path in (source/'lib').glob('python3.*'):

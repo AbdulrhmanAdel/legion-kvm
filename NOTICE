@@ -12,4 +12,5 @@ The guest CPU module is GPL-2.0. Changes to Linux and QEMU are distributed
 under the corresponding upstream licenses. Runtime images may include other
 components; their source notices must accompany redistributed runtime images.
 
-Cargo dependency licenses are declared by their respective packages.
+The packaged runtime includes source notices and Cargo dependency licenses
+under licenses/. Public source URLs and checksums accompany those notices.

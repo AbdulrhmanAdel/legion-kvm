@@ -16,7 +16,7 @@ test = false
 
 [[bin]]
 name = "legion-cpu-adapter-fixture"
-path = "src/fixture.rs"
+path = "tests/support/fixture.rs"
 test = false
 
 [dependencies]

@@ -7,7 +7,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs,
-    os::unix::fs::{DirBuilderExt, symlink},
+    os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -190,6 +190,22 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
     let runtime = Runtime::load(None)?;
     let graphics = crate::graphics::detect()?;
     let amd = matches!(graphics, crate::graphics::Graphics::Amd(_));
+    let display_backend = std::env::var("LEGION_DISPLAY_BACKEND")
+        .map(Some)
+        .or_else(|error| match error {
+            std::env::VarError::NotPresent => Ok(None),
+            error => Err(error),
+        })?;
+    if let Some(backend) = &display_backend {
+        ensure!(
+            matches!(backend.as_str(), "auto" | "wayland" | "xwayland"),
+            "LEGION_DISPLAY_BACKEND must be auto, wayland or xwayland"
+        );
+        ensure!(
+            !amd || backend != "xwayland",
+            "the AMD display backend requires Wayland"
+        );
+    }
     let report = runtime.inspect();
     ensure!(
         report.passed,
@@ -267,34 +283,27 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
             readonly: false,
         },
     ];
-    let wine_prefix = request
+    let selected_prefix = request
         .prefix
         .or_else(|| std::env::var_os("WINEPREFIX").map(PathBuf::from));
-    let compatdata = if let Some(prefix) = &wine_prefix {
-        let prefix = directory(prefix)?;
-        let shim = directory(&state.join("compatdata-shim"))?;
-        let link = shim.join("pfx");
-        if !link.exists() && !link.is_symlink() {
-            symlink(&prefix, &link)?;
-        }
-        ensure!(
-            fs::read_link(&link)? == prefix,
-            "prefix selection changed for this game; select a separate Legion state directory"
-        );
+    let (compatdata, wine_prefix) = if let Some(selected) = selected_prefix {
+        let paths = crate::prefix::resolve(&selected, &state)?;
         shares.push(Source {
             tag: "wine-prefix".into(),
-            directory: prefix,
+            directory: paths.prefix.clone(),
             readonly: false,
         });
-        shim
+        (paths.compatdata, Some(paths.prefix))
     } else {
-        directory(
-            &std::env::var_os("STEAM_COMPAT_DATA_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| state.join("compatdata")),
-        )?
+        (
+            directory(
+                &std::env::var_os("STEAM_COMPAT_DATA_PATH")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| state.join("compatdata")),
+            )?,
+            None,
+        )
     };
-    let wine_prefix = wine_prefix.map(|p| p.canonicalize()).transpose()?;
     shares.push(Source {
         tag: "proton-compatdata".into(),
         directory: compatdata.clone(),
@@ -346,6 +355,9 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
     )?;
     let mut launch: serde_json::Value =
         serde_json::from_slice(&fs::read(fixture.join("game-launch.json"))?)?;
+    if let Some(backend) = display_backend {
+        launch["display_backend"] = backend.into();
+    }
     let mut overrides = std::env::var("WINEDLLOVERRIDES").unwrap_or_default();
     for (name, value) in [
         ("winmm", "n,b"),
@@ -380,7 +392,12 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
                 || k.starts_with("VKD3D_")
                 || matches!(
                     k.as_str(),
-                    "SteamAppId" | "SteamGameId" | "WINEDEBUG" | "LANG" | "LC_ALL"
+                    "SteamAppId"
+                        | "SteamGameId"
+                        | "WINEDEBUG"
+                        | "LANG"
+                        | "LC_ALL"
+                        | "LEGION_WORKLOAD_DIRECTORY"
                 )
         })
         .collect();
@@ -425,7 +442,8 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
         fs::write(
             &display_path,
             serde_json::to_vec_pretty(
-                &serde_json::json!({"schema":1,"client":"external","application":true,"width":1920,"height":1080}),
+                &serde_json::json!({"schema":1,"client":"external","application":true,"width":1920,"height":1080,
+                    "fullscreen":std::env::var("LEGION_FULLSCREEN").is_ok_and(|value|value=="1")}),
             )?,
         )?;
         let mut args = vec![
@@ -516,33 +534,5 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn steam_command_keeps_selected_proton_and_game_argument_boundaries() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let proton = root.path().join("Proton with spaces");
-        fs::create_dir_all(proton.join("files/bin"))?;
-        fs::write(proton.join("files/bin/wine"), b"owned")?;
-        fs::write(proton.join("proton"), b"owned")?;
-        let game = root.path().join("A game");
-        fs::create_dir_all(game.join("Engine"))?;
-        fs::create_dir_all(game.join("bin"))?;
-        let exe = game.join("bin/Game.exe");
-        fs::write(&exe, b"owned")?;
-        let args = vec![
-            OsString::from("container-wrapper"),
-            OsString::from("--"),
-            proton.join("proton").into_os_string(),
-            "waitforexitandrun".into(),
-            exe.clone().into_os_string(),
-            "one argument with spaces".into(),
-        ];
-        let r = parse(&args)?;
-        assert_eq!(r.proton, proton);
-        assert_eq!(r.executable, exe);
-        assert_eq!(r.root, game);
-        assert_eq!(r.arguments, ["one argument with spaces"]);
-        Ok(())
-    }
-}
+#[path = "../tests/unit/game.rs"]
+mod tests;

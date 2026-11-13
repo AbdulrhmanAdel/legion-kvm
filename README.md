@@ -44,61 +44,82 @@ legion --version
 
 `LEGION_RENDER_NODE` selects a DRM render node on systems with multiple GPUs.
 `LEGION_MEMORY_MIB` selects guest memory; the default is 12288 MiB.
+`LEGION_FULLSCREEN=1` opens the AMD display fullscreen at its configured resolution.
+`LEGION_DISPLAY_BACKEND=auto|wayland|xwayland` selects Wine's display backend on NVIDIA; the default remains XWayland. Direct Wayland requires support in the selected Proton build. AMD uses Wayland.
 `LEGION_STARTUP_UI=auto|window|log|off` controls startup feedback. Runtime files
 are cached under `XDG_CACHE_HOME/legion`; logs use `XDG_STATE_HOME/legion`.
 
 ## Building
 
-The workspace requires Rust 1.99 and Linux development libraries for Wayland,
-XKB, EGL, GBM, DRM, SDL2 and Vulkan. Build the Rust components with:
+Install Python 3.11 or later and rootless Podman, or use an accessible Docker
+engine. The complete build uses an isolated Debian toolchain; host Rust and
+development libraries are not required. Allow at least 25 GiB of free disk
+space and an internet connection for the first build.
+
+Clone the repository and build the executable:
 
 ```sh
-cargo build --release --workspace
+git clone https://github.com/brcly/legion-kvm.git
+cd legion-kvm
+python3 tools/build.py --proton /path/to/GE-Proton11-11 --jobs 4
 ```
 
-The launcher binary is `target/release/legion`. A source build does not contain
-a guest image. Packaging requires a prepared runtime manifest, guest kernel,
-matching modules, guest userspace, QEMU, virtiofsd and the selected GPU backend.
-Those components are built separately; they are not downloaded by the launcher.
+The result is **`build/dist/legion`**. This single executable includes the guest
+kernel, matching modules, graphics backends, QEMU and guest userspace. Copy it
+to another supported system and mark it executable. Users supply their own
+applications and installed Proton; neither is included in the executable.
 
-The NVIDIA backend is a separate workspace with its original component
-licenses:
+The current compatibility input is GE-Proton11-11. The build verifies the
+selected installation against `config/compatibility.json` before compiling.
+It reads that installation without modifying it. A different Proton version
+needs a compatible repair recipe; bypassing the hash check is unsupported.
+
+Public dependency sources and checksums are recorded in `config/sources.json`.
+Portable host ABI packages are pinned in `config/host-packages.json`.
+The build downloads and compiles those sources, builds the Rust workspaces,
+assembles the runtime and checks host-tool startup without AVX-512. Downloads
+and intermediate outputs stay under the ignored `build/` directory. Repeating
+the command resumes completed stages. Use `--output` for another build directory
+or `--engine docker` to select Docker explicitly.
+
+No module is installed into the host kernel. Runtime use requires x86-64 Linux,
+enabled hardware virtualization, access to `/dev/kvm`, a Wayland desktop, and a
+supported NVIDIA or AMD graphics device. GPU drivers remain on the host. Intel
+CPUs use the same KVM launch path; Intel graphics are not supported.
+
+To check the resulting executable before launching an application:
 
 ```sh
-cargo build --release --manifest-path backends/nvidia/Cargo.toml \
-  -p device --features vhost-user --bin vhost-user-nvgpu
+build/dist/legion doctor
+build/dist/legion cpu-check
 ```
 
-`kernel/build_guest.py` builds the guest kernel from a supplied Linux source
-tree. `guest-cpuid/` contains the guest CPU-control module. Build all guest
-modules against the exact guest kernel output tree, never against the host
-kernel as an installation step.
-
-`tools/` contains helpers for QEMU, RADV, userspace preparation, compatibility
-recipes and runtime packaging. Runtime helper files live under
-`/usr/share/legion` in the guest. To append a prepared runtime to a static
-launcher:
-
-```sh
-python3 tools/build_single_file.py --runtime /path/to/runtime \
-  --launcher /path/to/static/legion --output dist/legion
-```
-
-Host-side binaries and libraries must target a portable CPU baseline. Before
-packaging, check the host tools without AVX-512:
-
-```sh
-python3 tools/verify_portable_host.py --runtime /path/to/runtime \
-  --output /path/to/portability.json
-```
+`cargo build --release` builds only the launcher for development. Use the
+Python build command above for a complete, distributable executable.
 
 ## Development
 
+Local Rust development requires Rust 1.99 and development libraries for
+Wayland, XKB, EGL, GBM, DRM, SDL2 and Vulkan. The NVIDIA backend has a separate
+Cargo workspace under `backends/nvidia`.
+
+Unit tests live in each package’s `tests/unit/` directory (backend binary tests
+use `tests/bin/`). Test-only fixtures and helper executables live under
+`tests/support/`, with recorded fixture data in `tests/fixtures/`. Rust source
+modules load their unit tests with `#[cfg(test)]` and explicit paths, preserving
+private access without exposing internal APIs.
+Launcher integration tests stay in `tests/cli.rs`; Python tests live in
+`tests/python/`.
+
 ```sh
+PYTHONPATH=tools python3 -m unittest discover -s tests/python -p 'test_*.py'
 cargo fmt --all --check
 cargo check --workspace --all-targets --all-features
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo fmt --all --manifest-path backends/nvidia/Cargo.toml --check
+cargo test --workspace --manifest-path backends/nvidia/Cargo.toml --features device/vhost-user
+cargo clippy --workspace --all-targets --manifest-path backends/nvidia/Cargo.toml --features device/vhost-user -- -D warnings
 ```
 
 ## License

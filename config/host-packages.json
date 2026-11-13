@@ -1,0 +1,18 @@
+{
+  "glibc-2.44+r50+g1848099f063e-1-x86_64.pkg.tar.zst": {
+    "url": "https://archive.archlinux.org/packages/g/glibc/glibc-2.44%2Br50%2Bg1848099f063e-1-x86_64.pkg.tar.zst",
+    "sha256": "e8e4d50d45cb2bd21c9f7eabacc6a01bd5eb93dbd476f3f44d44038fc1eba417"
+  },
+  "libgcc-16.2.1+r23+gd564253eb6c8-1-x86_64.pkg.tar.zst": {
+    "url": "https://archive.archlinux.org/packages/l/libgcc/libgcc-16.2.1%2Br23%2Bgd564253eb6c8-1-x86_64.pkg.tar.zst",
+    "sha256": "7367dad49fc3229bde804816d412ab77306d433b1f92e4126b8b3ba3502c67d6"
+  },
+  "libdrm-2.4.134-1-x86_64.pkg.tar.zst": {
+    "url": "https://archive.archlinux.org/packages/l/libdrm/libdrm-2.4.134-1-x86_64.pkg.tar.zst",
+    "sha256": "29d101f13d219d01ee4aae25e8f84026e0740d747d56c37ea5573c4618e7df04"
+  },
+  "libstdc++-16.2.1+r23+gd564253eb6c8-1-x86_64.pkg.tar.zst": {
+    "url": "https://archive.archlinux.org/packages/l/libstdc++/libstdc%2B%2B-16.2.1%2Br23%2Bgd564253eb6c8-1-x86_64.pkg.tar.zst",
+    "sha256": "15dc6bd2f3a2ee17fcd79a14325e9e0037722a592b2bdc55e1665d92112eaa51"
+  }
+}

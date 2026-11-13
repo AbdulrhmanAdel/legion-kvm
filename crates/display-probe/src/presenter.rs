@@ -44,7 +44,7 @@ fn run() -> Result<()> {
     let sdl = sdl2::init().map_err(anyhow::Error::msg)?;
     let video = sdl.video().map_err(anyhow::Error::msg)?;
     let window = video
-        .window("Legion v2 — live Vulkan readback probe", width, height)
+        .window("Legion — graphics check", width, height)
         .position_centered()
         .resizable()
         .build()?;

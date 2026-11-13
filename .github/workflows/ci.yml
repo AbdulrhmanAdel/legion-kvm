@@ -12,6 +12,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - run: PYTHONPATH=tools python3 -m unittest discover -s tests/python -p 'test_*.py'
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.0

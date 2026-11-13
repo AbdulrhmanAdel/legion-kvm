@@ -1,0 +1,41 @@
+FROM docker.io/amd64/debian:13-slim@sha256:1e1a22175fbf1b32157ddaf0219e1db4e5401fab2b94ed285add64d18587cd2d
+ENV DEBIAN_FRONTEND=noninteractive
+RUN sed -i 's/Components: main$/Components: main contrib/' /etc/apt/sources.list.d/debian.sources \
+    && dpkg --add-architecture i386 \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl git build-essential clang lld \
+    llvm musl-tools python3 python3-venv python3-pip python3-mako \
+    python3-yaml python3-packaging ninja-build pkg-config meson bison \
+    flex bc autoconf automake libtool xz-utils \
+    zstd patch bzip2 cpio file libarchive-tools \
+    libglib2.0-dev libpixman-1-dev libfdt-dev libpulse-dev libpipewire-0.3-dev libepoxy-dev \
+    libgbm-dev libdrm-dev libelf-dev libexpat1-dev libwayland-dev wayland-protocols \
+    libxkbcommon-dev libsdl2-dev libx11-dev libxext-dev libxrandr-dev libxrender-dev \
+    libx11-xcb-dev libxcb-dri3-dev libxcb-present-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-sync-dev \
+    libxcb-xfixes0-dev libxcb-render0-dev libxcb-shape0-dev libxshmfence-dev libva-dev libvulkan-dev \
+    libcap-ng-dev libseccomp-dev libasound2-dev libssl-dev libffi-dev libzstd-dev \
+    zlib1g-dev libunwind-dev virtiofsd qemu-user vulkan-tools xwayland \
+    xauth x11-xkb-utils x11-xserver-utils bash dash xdg-user-dirs \
+    locales libgl1 libegl1 libgles2 libglx0 libnvidia-egl-gbm1 \
+    libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 libfontconfig1 libfreetype6 libdbus-1-3 libgnutls30t64 \
+    libldap2 libpng16-16t64 libjpeg62-turbo libtiff6 libvpx9 libvulkan1 \
+    mangohud libudev1 libusb-1.0-0 libopenal1 libunwind8 libc6:i386 \
+    libgcc-s1:i386 libstdc++6:i386 libasound2t64:i386 libfontconfig1:i386 libfreetype6:i386 libudev1:i386 \
+    libvulkan1:i386 libx11-6:i386 libxext6:i386 libxrender1:i386 libxrandr2:i386 libpulse0:i386 \
+    libgstreamer1.0-0:i386 libgstreamer-plugins-base1.0-0:i386 libunwind8:i386 libgl1:i386 libgnutls30t64:i386 libcurl4t64 \
+    libxcomposite1 glslang-tools spirv-tools python3-ply python3-pycparser python3-jinja2 \
+    libblas3 liblapack3 libpcsclite1 libvdpau1 libxfixes3:i386 libblas3:i386 \
+    liblapack3:i386 libgssapi-krb5-2:i386 libnghttp2-14:i386 libpcsclite1:i386 libpsl5t64:i386 libsqlite3-0:i386 \
+    libusb-1.0-0:i386 libva-drm2:i386 libva-x11-2:i386 libva2:i386 libvdpau1:i386 libwayland-client0:i386 \
+    libwayland-cursor0:i386 libwayland-egl1:i386 \
+    && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
+    -y --profile minimal --default-toolchain 1.99.0 --target x86_64-unknown-linux-musl \
+    && /opt/cargo/bin/rustup component add --toolchain 1.99.0 clippy rustfmt
+ENV PATH=/opt/cargo/bin:$PATH RUSTUP_TOOLCHAIN=1.99.0
+RUN python3 -m venv --system-site-packages /opt/python \
+    && /opt/python/bin/pip install --no-cache-dir meson==1.10.0
+ENV PATH=/opt/python/bin:$PATH
+ENV CFLAGS="-march=x86-64 -mtune=generic" CXXFLAGS="-march=x86-64 -mtune=generic"
+WORKDIR /src

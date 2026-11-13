@@ -1,0 +1,7 @@
+.git
+build
+target
+dist
+runtime
+**/target
+**/__pycache__

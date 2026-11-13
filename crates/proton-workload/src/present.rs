@@ -578,6 +578,7 @@ pub(super) fn run(config: &Config, frequency: u64) -> Result<()> {
     let mut cpu_frames_verified = 0_u64;
     let mut checks = Vec::new();
     let mut samples = Vec::with_capacity(1_000_000);
+    let mut diagnostic_frames = Vec::new();
     let mut stage_samples =
         Vec::<[u64; 8]>::with_capacity(if settings.stage_probe { 1_000_000 } else { 0 });
     let mut blocked_slots = 0_u64;
@@ -644,6 +645,9 @@ pub(super) fn run(config: &Config, frequency: u64) -> Result<()> {
             cpu_frames_verified += 1;
         }
         let observed = renderer.draw(seed, diagnostic, settings.stage_probe)?;
+        if diagnostic {
+            diagnostic_frames.push(samples.len());
+        }
         if let Some(hash) = observed.image_hash {
             checks.push(serde_json::json!({"width":width,"height":height,"seed":seed,"hash":hash,"pixels":u64::from(width)*u64::from(height)}));
         }
@@ -682,6 +686,14 @@ pub(super) fn run(config: &Config, frequency: u64) -> Result<()> {
         return Err("missing presentation GPU validation".into());
     }
     let frames = samples.len();
+    let raw = serde_json::json!({
+        "schema":1,"frequency":frequency,"ticks":samples,"diagnostic_frames":diagnostic_frames,
+        "warmup_ms":config.warmup_ms
+    });
+    write_handle(
+        open("Z:\\frames\\frame-times.json", true)?.0,
+        &serde_json::to_vec(&raw).map_err(|error| error.to_string())?,
+    )?;
     let timing = timing_summary(&mut samples, frequency).ok_or("no presented frames")?;
     let fps = frame_rate(&samples, frequency).ok_or("invalid source frame rate")?;
     let mut stage_report = serde_json::Map::new();

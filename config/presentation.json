@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "width": 1920,
+  "height": 1080,
+  "warmup_ms": 200,
+  "sample_ms": 1000,
+  "cpu_rounds": 100000,
+  "gpu_clears": 64,
+  "presentation": {
+    "seconds": 15,
+    "resize": false
+  }
+}

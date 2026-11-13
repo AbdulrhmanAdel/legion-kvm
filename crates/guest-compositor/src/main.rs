@@ -14,7 +14,9 @@ mod native_amd;
 mod offscreen;
 mod state;
 #[cfg(test)]
+#[path = "../tests/unit/surface.rs"]
 mod surface_tests;
+mod syncobj;
 mod vm_forward;
 mod xwayland;
 

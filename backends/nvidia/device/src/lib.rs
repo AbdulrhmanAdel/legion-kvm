@@ -10,6 +10,8 @@ pub mod legion_window_pages;
 pub mod mmap;
 pub mod nvidia;
 pub mod posture;
+#[cfg(test)]
+#[path = "../tests/support/replay.rs"]
 pub mod replay;
 pub mod sandbox;
 pub mod shm;

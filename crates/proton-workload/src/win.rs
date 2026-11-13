@@ -78,6 +78,7 @@ unsafe extern "system" {
         template: *mut c_void,
     ) -> *mut c_void;
     fn CloseHandle(handle: *mut c_void) -> i32;
+    fn GetEnvironmentVariableW(name: *const u16, value: *mut u16, size: u32) -> u32;
     fn QueryPerformanceCounter(value: *mut i64) -> i32;
     fn QueryPerformanceFrequency(value: *mut i64) -> i32;
     fn GetActiveProcessorCount(group: u16) -> u32;
@@ -142,6 +143,30 @@ fn log(message: &str) {
 }
 
 fn open(path: &str, write: bool) -> Result<Handle> {
+    let directory: Vec<u16> = "LEGION_WORKLOAD_DIRECTORY\0".encode_utf16().collect();
+    let mut value = vec![0_u16; 32768];
+    // SAFETY: the name is terminated and the writable buffer has the supplied capacity.
+    let length = unsafe {
+        GetEnvironmentVariableW(directory.as_ptr(), value.as_mut_ptr(), value.len() as u32)
+    } as usize;
+    if length >= value.len() {
+        return Err("workload directory exceeds the Windows path limit".into());
+    }
+    let override_path = if length != 0 {
+        path.strip_prefix("Z:\\frames\\")
+            .map(|name| {
+                let directory = String::from_utf16(&value[..length])
+                    .map_err(|_| "workload directory is not valid UTF-16")?;
+                Ok::<_, &str>(format!(
+                    "{}\\{name}",
+                    directory.trim_end_matches(['\\', '/'])
+                ))
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let path = override_path.as_deref().unwrap_or(path);
     let wide: Vec<u16> = path.encode_utf16().chain(core::iter::once(0)).collect();
     // SAFETY: path is NUL terminated; no security/template pointers.
     let h = unsafe {
@@ -919,8 +944,6 @@ fn run() -> Result<()> {
         return Ok(());
     }
     let config = read_config()?;
-    cpu_audit::run_if_requested()?;
-    nt_audit::run_if_requested()?;
     let mut frequency = 0;
     // SAFETY: writable frequency output lives across the synchronous OS call.
     if unsafe { QueryPerformanceFrequency(&mut frequency) } == 0 || frequency <= 0 {
@@ -929,6 +952,9 @@ fn run() -> Result<()> {
     if config.presentation.is_some() {
         return present::run(&config, frequency as u64);
     }
+    // Protocol self-tests use their own handlers and remain separate from rendering measurements.
+    cpu_audit::run_if_requested()?;
+    nt_audit::run_if_requested()?;
     let mut gpu = Gpu::new(&config, frequency as u64)?;
     log("stage: verify D3D12 GPU output before timing");
     let before = gpu.verify()?;
@@ -1009,6 +1035,9 @@ extern "system" fn mainCRTStartup() -> ! {
         Ok(()) => 0,
         Err(e) => {
             log(&format!("LEGION_PROTON_WORKLOAD_FAILED: {e}"));
+            if let Ok(file) = open("Z:\\frames\\workload-error.txt", true) {
+                let _ = write_handle(file.0, e.as_bytes());
+            }
             1
         }
     };

@@ -23,6 +23,12 @@ const STACK_BYTES: u32 = 128;
 #[path = "driver_context.rs"]
 mod driver_context_probe;
 #[cfg(feature = "syscall-count-probe")]
+#[path = "queue_endpoints.rs"]
+mod queue_endpoints;
+#[cfg(feature = "syscall-count-probe")]
+#[path = "queue_latency.rs"]
+mod queue_latency;
+#[cfg(feature = "syscall-count-probe")]
 #[path = "syscall_counts.rs"]
 mod syscall_probe;
 
@@ -58,6 +64,14 @@ fn sampling_attribute() -> Attr {
         wakeup: 1,
         regs: REG_MASK,
         ..Attr::default()
+    }
+}
+
+fn cycle_sampling_attribute() -> Attr {
+    Attr {
+        kind: 0,
+        period: 2_000_003,
+        ..sampling_attribute()
     }
 }
 
@@ -412,7 +426,10 @@ fn image_pid() -> Result<Option<i32>> {
 enum Target {
     Main,
     Present,
+    Queue { cycles: bool, kernel: bool },
     Syscalls,
+    QueueEndpoints,
+    QueueLatency,
     QueuePlacement { colocate: bool, server: bool },
 }
 
@@ -424,17 +441,46 @@ fn collect_profile(receive: mpsc::Receiver<()>, target: Target) -> Result<()> {
         );
     }
     let present_worker = matches!(target, Target::Present);
-    let syscall_counts = matches!(target, Target::Syscalls | Target::QueuePlacement { .. });
+    let queue_worker = matches!(
+        target,
+        Target::Queue { .. }
+            | Target::QueueEndpoints
+            | Target::QueueLatency
+            | Target::QueuePlacement { .. }
+    );
+    let cycle_sampling = matches!(target, Target::Queue { cycles: true, .. });
+    let kernel_sampling = matches!(target, Target::Queue { kernel: true, .. });
+    let syscall_counts = matches!(target, Target::Syscalls);
     let deadline = Instant::now() + Duration::from_secs(20);
     let (pid, tid) = loop {
-        if present_worker || syscall_counts {
+        if present_worker {
             if let Ok(bytes) = fs::read("/tmp/legion-vk-present-thread.json")
                 && let Some((pid, tid)) = marker_ids(&bytes)
                 && let Ok(maps) = fs::read_to_string(format!("/proc/{pid}/maps"))
                 && has_fixture_image(&maps)
                 && std::path::Path::new(&format!("/proc/{pid}/task/{tid}")).is_dir()
             {
-                break (pid, if syscall_counts { pid } else { tid });
+                break (pid, tid);
+            }
+        } else if syscall_counts {
+            if let Some(pid) = image_pid()? {
+                break (pid, pid);
+            }
+        } else if queue_worker {
+            if let Some(pid) = image_pid()? {
+                let mut found = None;
+                for task in fs::read_dir(format!("/proc/{pid}/task"))? {
+                    let task = task?;
+                    if fs::read_to_string(task.path().join("comm"))
+                        .is_ok_and(|name| name.trim() == "vkd3d_queue")
+                    {
+                        ensure!(found.is_none(), "multiple owned queue workers");
+                        found = Some(task.file_name().to_string_lossy().parse::<i32>()?);
+                    }
+                }
+                if let Some(tid) = found {
+                    break (pid, tid);
+                }
             }
         } else if let Some(pid) = image_pid()? {
             break (pid, pid);
@@ -457,6 +503,14 @@ fn collect_profile(receive: mpsc::Receiver<()>, target: Target) -> Result<()> {
     let starttime =
         identity(&fs::read_to_string(&stat_path)?).context("missing workload start time")?;
     #[cfg(feature = "syscall-count-probe")]
+    if matches!(target, Target::QueueLatency) {
+        return queue_latency::collect(receive, pid, tid);
+    }
+    #[cfg(feature = "syscall-count-probe")]
+    if matches!(target, Target::QueueEndpoints) {
+        return queue_endpoints::collect(receive, pid, tid, &starttime);
+    }
+    #[cfg(feature = "syscall-count-probe")]
     if let Target::QueuePlacement { colocate, server } = target {
         return syscall_probe::place_queues(receive, pid, &starttime, colocate, server);
     }
@@ -464,7 +518,19 @@ fn collect_profile(receive: mpsc::Receiver<()>, target: Target) -> Result<()> {
     if syscall_counts {
         return syscall_probe::collect(receive, pid, &starttime);
     }
-    let mut ring = Ring::open(tid, present_worker)?;
+    let mut ring = if cycle_sampling || kernel_sampling {
+        let mut attr = if cycle_sampling {
+            cycle_sampling_attribute()
+        } else {
+            sampling_attribute()
+        };
+        if kernel_sampling {
+            attr.flags &= !(1 << 5);
+        }
+        Ring::from_attribute(tid, attr, false)?
+    } else {
+        Ring::open(tid, present_worker)?
+    };
     ensure!(
         identity(&fs::read_to_string(&stat_path)?).as_deref() == Some(starttime.as_str()),
         "profile target changed while attaching"
@@ -473,6 +539,7 @@ fn collect_profile(receive: mpsc::Receiver<()>, target: Target) -> Result<()> {
     let mut samples = Vec::with_capacity(MAX_SAMPLES);
     let mut mappings = Vec::new();
     let mut markers = Vec::new();
+    let mut thread_accounting = Vec::new();
     let environment: std::collections::BTreeMap<_, _> = [
         "/proc/mtrr",
         "/sys/devices/system/cpu/vulnerabilities/spectre_v2",
@@ -531,6 +598,14 @@ fn collect_profile(receive: mpsc::Receiver<()>, target: Target) -> Result<()> {
             if let Ok(value) = fs::read_to_string(format!("/proc/{pid}/smaps")) {
                 smaps = value;
             }
+            if queue_worker {
+                let task = format!("/proc/{pid}/task/{tid}");
+                let read = |name| fs::read_to_string(format!("{task}/{name}")).ok();
+                thread_accounting.push(serde_json::json!({"time_ns":now,
+                    "stat":read("stat"),"schedstat":read("schedstat"),
+                    "status":read("status"),"wchan":read("wchan"),
+                    "cpu_stat":fs::read_to_string("/proc/stat").ok()}));
+            }
             last_maps = Instant::now();
         }
         match receive.recv_timeout(Duration::from_millis(2)) {
@@ -540,15 +615,33 @@ fn collect_profile(receive: mpsc::Receiver<()>, target: Target) -> Result<()> {
     }
     ring.drain(&mut samples, &mut lost)?;
     ensure!(
-        !samples.is_empty() && (present_worker || !markers.is_empty()),
+        !samples.is_empty() && (present_worker || queue_worker || !markers.is_empty()),
         "CPU profile has no samples or measurement markers"
     );
     #[allow(unused_mut)]
-    let mut report = serde_json::json!({"schema":1,"diagnostic_only":true,"pid":pid,"target_tid":tid,"present_worker":present_worker,"starttime":starttime,
+    let mut report = serde_json::json!({"schema":1,"diagnostic_only":true,"pid":pid,"target_tid":tid,"present_worker":present_worker,"queue_worker":queue_worker,"starttime":starttime,
                 "event":"software cpu-clock userspace only","clock":"CLOCK_MONOTONIC","period_ns":500000,"register_mask":REG_MASK,
                 "lost":lost,"samples":samples,"mappings":mappings,"markers":markers,
-                "environment":environment,"last_smaps":smaps,
+                "environment":environment,"last_smaps":smaps,"counters":counters.read(),
+                "thread_accounting":thread_accounting,
         "marker_uncertainty":"flushed stdout polled nominally every 2 ms; processing and scheduling can add delay; not exact instruction boundaries"});
+    if cycle_sampling {
+        report["event"] = serde_json::json!("hardware cycles userspace only");
+        report["period_cycles"] = serde_json::json!(cycle_sampling_attribute().period);
+        report
+            .as_object_mut()
+            .expect("profile object")
+            .remove("period_ns");
+    }
+    if kernel_sampling {
+        report["include_kernel"] = serde_json::json!(true);
+        report["event"] = serde_json::json!(if cycle_sampling {
+            "hardware cycles userspace and guest kernel"
+        } else {
+            "software cpu-clock userspace and guest kernel"
+        });
+        report["kernel_symbols"] = serde_json::json!(fs::read_to_string("/proc/kallsyms").ok());
+    }
     #[cfg(feature = "driver-context-probe")]
     if present_worker {
         report["driver_context_probe"] = context_probe.report();
@@ -562,6 +655,29 @@ pub(super) struct CpuProfile {
     worker: Option<thread::JoinHandle<Result<()>>>,
 }
 impl CpuProfile {
+    pub(super) fn prepare_queue_latency(
+        opcode: u32,
+        stride: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<()> {
+        #[cfg(feature = "syscall-count-probe")]
+        {
+            queue_latency::prepare(opcode, stride, uid, gid)
+        }
+        #[cfg(not(feature = "syscall-count-probe"))]
+        {
+            let _ = (opcode, stride, uid, gid);
+            anyhow::bail!("queue latency requires the development Cargo feature")
+        }
+    }
+    pub(super) fn start_queue_latency() -> Result<Self> {
+        ensure!(
+            cfg!(feature = "syscall-count-probe"),
+            "queue latency requires the development Cargo feature"
+        );
+        Self::start_target(Target::QueueLatency)
+    }
     pub(super) fn configure_guest_wakeups(direct: bool) -> Result<()> {
         #[cfg(feature = "syscall-count-probe")]
         {
@@ -579,12 +695,22 @@ impl CpuProfile {
     pub(super) fn start_present_worker() -> Result<Self> {
         Self::start_target(Target::Present)
     }
+    pub(super) fn start_queue_worker(cycles: bool, kernel: bool) -> Result<Self> {
+        Self::start_target(Target::Queue { cycles, kernel })
+    }
     pub(super) fn start_syscalls() -> Result<Self> {
         ensure!(
             cfg!(feature = "syscall-count-probe"),
             "syscall counts require the development Cargo feature"
         );
         Self::start_target(Target::Syscalls)
+    }
+    pub(super) fn start_queue_endpoints() -> Result<Self> {
+        ensure!(
+            cfg!(feature = "syscall-count-probe"),
+            "endpoint profiling requires the development Cargo feature"
+        );
+        Self::start_target(Target::QueueEndpoints)
     }
     pub(super) fn start_queue_placement(colocate: bool, server: bool) -> Result<Self> {
         ensure!(
@@ -600,7 +726,13 @@ impl CpuProfile {
         let private_native = init == std::path::Path::new("/usr/bin/bwrap")
             && args.contains(&b"--unshare-pid".as_slice())
             && args.contains(&b"/usr/share/legion/bootstrap".as_slice());
-        if matches!(target, Target::Syscalls | Target::QueuePlacement { .. }) {
+        if matches!(
+            target,
+            Target::Syscalls
+                | Target::QueuePlacement { .. }
+                | Target::QueueEndpoints
+                | Target::QueueLatency
+        ) {
             ensure!(
                 init == std::path::Path::new("/init")
                     && fs::read_to_string("/proc/cmdline")?.contains("legion.vulkan=1"),
@@ -643,77 +775,5 @@ impl Drop for CpuProfile {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn worker_marker_needs_positive_ids_and_the_exact_fixture_mapping() {
-        assert_eq!(marker_ids(br#"{"schema":1,"pid":7,"tid":9}"#), Some((7, 9)));
-        for bytes in [
-            br#"{"schema":1,"pid":0,"tid":9}"#.as_slice(),
-            br#"{"schema":2,"pid":7,"tid":9}"#,
-            b"{",
-            br#"{"schema":1,"pid":7,"tid":-2}"#,
-        ] {
-            assert_eq!(marker_ids(bytes), None);
-        }
-        assert!(has_fixture_image(
-            "1000-2000 r--p 0 00:00 1 /usr/share/legion/workload.exe"
-        ));
-        assert!(!has_fixture_image(
-            "1000-2000 r--p 0 00:00 1 /other/workload.exe"
-        ));
-    }
-
-    #[test]
-    fn user_stack_captures_only_valid_bytes_and_rejects_bad_extents() {
-        let mut bytes = vec![0; 40];
-        bytes.extend_from_slice(&16_u64.to_ne_bytes());
-        bytes.extend_from_slice(&0x1234_u64.to_ne_bytes());
-        bytes.extend_from_slice(&0x5678_u64.to_ne_bytes());
-        bytes.extend_from_slice(&8_u64.to_ne_bytes());
-        assert_eq!(
-            decode_sample_with_stack(&bytes, true)
-                .expect("bounded stack")
-                .stack_words,
-            [0x1234]
-        );
-        bytes[64..72].copy_from_slice(&17_u64.to_ne_bytes());
-        assert!(decode_sample_with_stack(&bytes, true).is_err());
-        bytes[40..48].copy_from_slice(&u64::from(STACK_BYTES + 8).to_ne_bytes());
-        assert!(decode_sample_with_stack(&bytes, true).is_err());
-        assert!(decode_sample_with_stack(&[0; 40], true).is_err());
-    }
-    #[test]
-    fn sampling_clock_matches_markers_and_does_not_inherit_or_include_kernel_work() {
-        let attr = sampling_attribute();
-        assert_eq!(attr.kind, 1);
-        assert_eq!(attr.clock, libc::CLOCK_MONOTONIC);
-        assert_ne!(attr.flags & (1 << 25), 0);
-        assert_eq!(attr.flags & (1 << 1), 0);
-        assert_eq!(attr.flags & ((1 << 5) | (1 << 6)), (1 << 5) | (1 << 6));
-        assert_eq!(attr.regs, REG_MASK);
-    }
-    #[test]
-    fn wrapped_records_and_short_samples_are_checked_without_reading_past_the_ring() {
-        assert_eq!(ring_segments(8, 6, 4).expect("wrapped"), (6, 2));
-        assert!(ring_segments(8, 0, 9).is_err());
-        assert!(decode_sample(&[0; 32]).is_err());
-        let mut sample = vec![0; 40];
-        sample[8..16].copy_from_slice(&99_u64.to_ne_bytes());
-        assert_eq!(decode_sample(&sample).expect("no-register ABI").ip, 99);
-        sample[32..40].copy_from_slice(&2_u64.to_ne_bytes());
-        assert!(decode_sample(&sample).is_err());
-        sample.resize(40 + REG_MASK.count_ones() as usize * 8, 0);
-        assert_eq!(
-            decode_sample(&sample).expect("full registers").regs.len(),
-            18
-        );
-        sample[32..40].copy_from_slice(&1_u64.to_ne_bytes());
-        assert_eq!(
-            decode_sample(&sample)
-                .expect("32-bit transition registers")
-                .abi,
-            1
-        );
-    }
-}
+#[path = "../tests/unit/cpu_profile.rs"]
+mod tests;

@@ -17,6 +17,7 @@ pub(crate) struct Cached {
     pub acquire_started: Option<Instant>,
     pub submitted: Option<Instant>,
     pub retired: bool,
+    pub release_point: Option<crate::syncobj::Release>,
 }
 
 pub(crate) fn ioctl(fd: &File, cmd: u32, data: &mut [u8]) -> Result<()> {
@@ -40,6 +41,36 @@ pub(crate) fn call(fd: &File, nr: u32, data: &mut [u8]) -> Result<()> {
         0xc000_4c00 | (u32::try_from(data.len())? << 16) | nr,
         data,
     )
+}
+
+fn wait_event_accounting(
+    frames: u64,
+    timeout: Duration,
+    mut read: impl FnMut(&mut [u8; 24]) -> Result<()>,
+) -> Result<[u8; 24]> {
+    let started = Instant::now();
+    loop {
+        let mut events = [0; 24];
+        read(&mut events)?;
+        let acknowledged = u64::from_le_bytes(events[8..16].try_into()?);
+        ensure!(
+            acknowledged <= frames,
+            "host acknowledged {acknowledged} events for {frames} frames"
+        );
+        if acknowledged == frames {
+            return Ok(events);
+        }
+        ensure!(
+            started.elapsed() < timeout,
+            "host event accounting timed out: acknowledged={acknowledged}, frames={frames}"
+        );
+        std::thread::sleep(Duration::from_micros(100));
+    }
+}
+
+pub(crate) fn final_event_accounting(fd: &File, frames: u64) -> Result<[u8; 24]> {
+    // The guest can consume a release before the host event thread updates its counters.
+    wait_event_accounting(frames, Duration::from_secs(3), |events| call(fd, 9, events))
 }
 
 #[derive(Default)]
@@ -94,6 +125,9 @@ fn apply(
             timing.calls += 1;
             timing.ns += ns;
             timing.max_ns = timing.max_ns.max(ns);
+        }
+        if let Some(point) = image.release_point.take() {
+            point.signal().context("signal forwarded buffer release")?;
         }
         if image.source.is_alive() {
             image.source.release();
@@ -322,50 +356,5 @@ impl Transport {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn combined_polling_preserves_deadline_and_consumes_fresh_release_credit() {
-        assert!(!poll_due(true, Duration::from_secs(1), true, false, false));
-        assert!(!poll_due(
-            true,
-            Duration::from_micros(99),
-            false,
-            true,
-            false
-        ));
-        assert!(poll_due(
-            true,
-            Duration::from_micros(100),
-            false,
-            true,
-            false
-        ));
-        assert!(poll_due(true, Duration::ZERO, true, true, false));
-        assert!(!poll_due(true, Duration::ZERO, true, true, true));
-        assert!(poll_due(true, Duration::from_micros(100), true, true, true));
-        assert!(poll_due(false, Duration::ZERO, true, false, true));
-        assert!(poll_due(
-            false,
-            Duration::from_micros(100),
-            false,
-            false,
-            true
-        ));
-    }
-
-    #[test]
-    #[cfg(not(miri))] // Exercises real OS readiness; GPU event delivery needs KVM.
-    fn notification_readiness_is_quiet_until_data_arrives_and_detects_disconnect() {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
-        let (mut reader, mut writer) = UnixStream::pair().expect("pair");
-        assert!(!notification_ready(&reader).expect("quiet"));
-        writer.write_all(&[1]).expect("notify");
-        assert!(notification_ready(&reader).expect("ready"));
-        reader.read_exact(&mut [0]).expect("consume");
-        assert!(!notification_ready(&reader).expect("quiet after consume"));
-        drop(writer);
-        assert!(notification_ready(&reader).is_err());
-    }
-}
+#[path = "../tests/unit/frame_transport.rs"]
+mod tests;

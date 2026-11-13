@@ -54,7 +54,9 @@ fn event_pump(
             if fence_ready(&nvidia, &vring, &mem, key) {
                 watched.remove(&key);
                 true
-            } else { false }
+            } else {
+                false
+            }
         });
         poll_fds.clear();
         keys.clear();
@@ -66,8 +68,11 @@ fn event_pump(
         });
         for (&key, fd) in &watched {
             // Ready sync-files remain readable.
-            if fence_pending.contains(key) || (key != DISPLAY_EVENT_KEY &&
-                key & FENCE_EVENT_KEY == 0 && !interest.contains(key as u32)) {
+            if fence_pending.contains(key)
+                || (key != DISPLAY_EVENT_KEY
+                    && key & FENCE_EVENT_KEY == 0
+                    && !interest.contains(key as u32))
+            {
                 continue;
             }
             keys.push(key);
@@ -93,10 +98,11 @@ fn event_pump(
             }
             if key == PUMP_WAKE_KEY {
                 if let Err(error) = wake.read()
-                    && error.kind() != std::io::ErrorKind::WouldBlock {
-                        log::error!("armed event wake: {error}");
-                        return;
-                    }
+                    && error.kind() != std::io::ErrorKind::WouldBlock
+                {
+                    log::error!("armed event wake: {error}");
+                    return;
+                }
             } else if key == DISPLAY_EVENT_KEY {
                 display_events(&nvidia, &vring, &mem);
             } else if key & FENCE_EVENT_KEY != 0 {

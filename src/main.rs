@@ -11,6 +11,7 @@ mod memory;
 mod native_bridge;
 mod native_context;
 mod packed;
+mod prefix;
 mod presentation;
 mod probe;
 mod process;
@@ -47,6 +48,7 @@ Selected Proton modules must match the runtime compatibility recipe.
 
 LEGION_RENDER_NODE selects a DRM render node on systems with multiple GPUs.
 LEGION_MEMORY_MIB sets guest memory in MiB; the default is 12288.
+LEGION_DISPLAY_BACKEND=auto|wayland|xwayland selects Wine's display backend on NVIDIA.
 LEGION_STARTUP_UI=auto|window|log|off controls startup feedback.
 Logs are saved under XDG_STATE_HOME/legion, normally ~/.local/state/legion.";
 

@@ -178,7 +178,7 @@ pub fn run(config: &Value) -> Result<()> {
     let application = config["application_client"] == true;
     let timeout = forwarding_timeout(application, benchmark, seconds);
     let diagnostics = application && config["diagnostic_frames"] == true;
-    let live_telemetry = diagnostics || (application && config["live_telemetry"] == true);
+    let live_telemetry = diagnostics || config["live_telemetry"] == true;
     ensure!(
         !application || (external && !benchmark),
         "application forwarding requires an external non-benchmark client"
@@ -261,14 +261,24 @@ pub fn run(config: &Value) -> Result<()> {
     let mut display = Display::<State>::new()?;
     let mut dh = display.handle();
     let mut gpu = acquire_gpu::Gpu::new(renderer, asynchronous)?;
+    let mut producer_timeline_acquires = 0_u64;
     let mut state = State::with_formats(
         &dh,
         None,
         formats,
-        fs::metadata(path)?.rdev(),
+        fs::metadata(&path)?.rdev(),
         width,
         height,
     )?;
+    let explicit_sync = if config["explicit_sync"] == true {
+        ensure!(
+            external,
+            "explicit synchronization requires an external producer"
+        );
+        state.enable_explicit_sync(&dh, OpenOptions::new().read(true).write(true).open(path)?)?
+    } else {
+        false
+    };
     let ordered_input = external && word(&info, 0) >= 8;
     state.track_buffers = true;
     state.gpu_only = external;
@@ -369,6 +379,7 @@ pub fn run(config: &Value) -> Result<()> {
             "discarded_on_selection_change":state.discarded_on_selection_change,
             "presentation_switches":state.presentation_switches,
             "source_pending":state.pending.is_some(),"shm_ignored":ignored_shm,
+            "explicit_sync":{"pending_acquires":state.pending_sync_acquires(),"timelines":crate::syncobj::report()},
             "registered_images":images.len(),"acquiring":acquisitions.len(),
             "gpu_fences":gpu.pending(),"submitted":frames,"returned":returned,
             "host_closed":host_closed,"input_queries":input_queries,
@@ -405,6 +416,7 @@ pub fn run(config: &Value) -> Result<()> {
             clients.push(dh.insert_client(stream, Arc::new(ClientState::default()))?);
         }
         display.dispatch_clients(&mut state)?;
+        state.poll_explicit_sync(&dh)?;
         if let Some(bridge) = xwayland.as_mut() {
             bridge.dispatch(&mut state)?;
         }
@@ -445,8 +457,8 @@ pub fn run(config: &Value) -> Result<()> {
                 .is_some_and(|buffer| get_dmabuf(buffer).is_err())
         {
             // Wine can attach SHM placeholders/decorations before its Vulkan swapchain.
-            if let Some(buffer) = state.pending.take() {
-                buffer.release();
+            if state.pending.is_some() {
+                state.discard_pending();
                 ignored_shm += 1;
             }
         }
@@ -505,6 +517,9 @@ pub fn run(config: &Value) -> Result<()> {
             if image.retired {
                 let mut data = image.id.to_le_bytes();
                 call(&fd, 5, &mut data)?;
+                if let Some(point) = image.release_point.take() {
+                    point.signal().context("release retired acquired source")?;
+                }
                 pacer.cancel_unsubmitted();
             } else {
                 if !acquired.payload.diagnostic {
@@ -552,6 +567,7 @@ pub fn run(config: &Value) -> Result<()> {
                     acquire_started: None,
                     submitted: None,
                     retired: false,
+                    release_point: None,
                 });
             }
             let image = images
@@ -562,6 +578,13 @@ pub fn run(config: &Value) -> Result<()> {
                 image.frame.is_none() && !image.retired && !acquisitions.contains(image.id),
                 "source reused leased buffer"
             );
+            ensure!(
+                image.release_point.is_none(),
+                "source reused a pending release point"
+            );
+            image.release_point = state.acquire_pending_release();
+            let producer_ready = image.release_point.is_some();
+            producer_timeline_acquires += u64::from(producer_ready);
             let dma = get_dmabuf(&buffer).context("missing image")?;
             ensure!(
                 (external
@@ -605,6 +628,9 @@ pub fn run(config: &Value) -> Result<()> {
                     Rectangle::from_size(size),
                     Fourcc::Abgr8888,
                 )?)
+            } else if producer_ready {
+                // The producer timeline already proves this image is ready for host use.
+                None
             } else {
                 // Smithay caches the EGLImage/renderbuffer/FBO by allocation.
                 let source = renderer.bind(&mut source_image)?;
@@ -687,7 +713,7 @@ pub fn run(config: &Value) -> Result<()> {
             }
             next_frame += 1;
             if asynchronous {
-                let fence = if diagnostic {
+                let fence = if diagnostic || producer_ready {
                     None
                 } else {
                     let (create_ns, flush_ns) = gpu.fence(next_frame)?;
@@ -822,6 +848,9 @@ pub fn run(config: &Value) -> Result<()> {
         state.inactive_surface_buffers,
         state.discarded_on_selection_change
     );
+    if explicit_sync {
+        state.discard_pending();
+    }
     state.close_clients();
     display.flush_clients()?;
     for image in &mut images {
@@ -843,7 +872,7 @@ pub fn run(config: &Value) -> Result<()> {
     );
     let mut events = [0_u8; 24];
     if transport.is_notified() {
-        call(&fd, 9, &mut events)?;
+        events = crate::frame_transport::final_event_accounting(&fd, frames)?;
         ensure!(
             wide(&events, 8) == frames,
             "host event acknowledgements disagree"
@@ -885,13 +914,39 @@ pub fn run(config: &Value) -> Result<()> {
             if let Some(bridge) = xwayland.as_mut() {
                 bridge.dispatch(&mut state)?;
             }
-            if let Some(buffer) = state.pending.take() {
-                buffer.release();
-            }
+            state.discard_pending();
+            state.poll_explicit_sync(&dh)?;
             state.send_callbacks(u32::try_from(start.elapsed().as_millis())?);
             display.flush_clients()?;
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+    if explicit_sync {
+        let end = Instant::now();
+        loop {
+            display.dispatch_clients(&mut state)?;
+            state.poll_explicit_sync(&dh)?;
+            state.discard_pending();
+            display.flush_clients()?;
+            if state.pending_sync_acquires() == 0 {
+                break;
+            }
+            ensure!(
+                end.elapsed() < Duration::from_secs(3),
+                "surface acquire shutdown timed out"
+            );
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        if let Some(error) = state.error.take() {
+            anyhow::bail!("surface synchronization: {error}");
+        }
+    }
+    ensure!(
+        state.pending_sync_acquires() == 0,
+        "surface acquires remain pending"
+    );
+    if explicit_sync {
+        crate::syncobj::validate_releases()?;
     }
     // Validation must not disconnect Wine while it is still completing Present/destructors; report failure only after the client shutdown wait.
     ensure!(
@@ -932,6 +987,23 @@ pub fn run(config: &Value) -> Result<()> {
             ns as f64 / submit_samples as f64 / 1e6
         }
     });
+    let timeline_only = asynchronous && producer_timeline_acquires == next_frame;
+    let acquire_dependency = if !asynchronous {
+        "readback_map"
+    } else if timeline_only {
+        "producer_timeline"
+    } else if producer_timeline_acquires > 0 {
+        "producer_timeline_or_gpu_blit"
+    } else {
+        "gpu_blit_fence"
+    };
+    let acquire_fence_type = if !asynchronous {
+        "none"
+    } else if timeline_only {
+        "drm_syncobj"
+    } else {
+        "gl_sync"
+    };
     let mut report = json!({
         "schema": 1,
         "passed": true,
@@ -948,9 +1020,9 @@ pub fn run(config: &Value) -> Result<()> {
         "transport_rpc": transport.report(),
         "completion_events": {"batches":wide(&events, 0), "acknowledgements":wide(&events, 8), "interrupt_requests":wide(&events, 16)},
         "acquire_mode": acquire_mode,
-        "acquire_dependency": if asynchronous { "gpu_blit_fence" } else { "readback_map" },
-        "acquire_fence_type": if asynchronous { "gl_sync" } else { "none" },
-        "acquire_barrier_pixels": 1,
+        "acquire_dependency":acquire_dependency,
+        "acquire_fence_type":acquire_fence_type,
+        "acquire_barrier_pixels": u32::from(!timeline_only),
         "acquire_barrier_mean_ms": if barrier_samples == 0 { 0.0 } else { barrier_ns as f64 / barrier_samples as f64 / 1e6 },
         "blocking_acquire_samples": barrier_samples,
         "acquire_submit_mean_ms": if submit_samples == 0 { 0.0 } else { submit_ns as f64 / submit_samples as f64 / 1e6 },
@@ -975,6 +1047,7 @@ pub fn run(config: &Value) -> Result<()> {
         "delivered_fps": frames as f64 / start.elapsed().as_secs_f64(),
         "client_log": fs::read_to_string("/tmp/vkcube-forward.log")?,
     });
+    report["producer_timeline_acquires"] = json!(producer_timeline_acquires);
     report["active_forward_seconds"] = json!(active_seconds);
     report["application_client"] = json!(application);
     report["initialization_seconds"] =
@@ -982,6 +1055,7 @@ pub fn run(config: &Value) -> Result<()> {
     report["host_commits_per_active_second"] = json!(frames as f64 / active_seconds);
     report["rate_scope"] = json!("host submissions; frame callbacks do not prove physical scanout");
     report["input_queries"] = json!(input_queries);
+    report["explicit_sync"] = json!({"enabled":explicit_sync,"pending_acquires":state.pending_sync_acquires(),"timelines":crate::syncobj::report()});
     report["xwayland"] = json!({
         "enabled": xwayland.is_some(),
         "mapped_windows": state.x11_maps,
@@ -1016,21 +1090,5 @@ pub fn run(config: &Value) -> Result<()> {
 }
 
 #[cfg(test)]
-mod timeout_tests {
-    use super::forwarding_timeout;
-    use std::time::Duration;
-
-    #[test]
-    fn application_keeps_running_after_an_hour_while_fixture_limits_remain() {
-        let elapsed = Duration::from_secs(3601);
-        assert!(forwarding_timeout(true, false, 15).is_none_or(|limit| elapsed < limit));
-        assert_eq!(
-            forwarding_timeout(false, true, 15),
-            Some(Duration::from_secs(75))
-        );
-        assert_eq!(
-            forwarding_timeout(false, false, 15),
-            Some(Duration::from_secs(55))
-        );
-    }
-}
+#[path = "../tests/unit/vm_forward_timeout_tests.rs"]
+mod timeout_tests;

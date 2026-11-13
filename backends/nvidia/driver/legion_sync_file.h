@@ -1,5 +1,6 @@
 /* Guest-only adapter. */
 #include <linux/dma-fence-array.h>
+#include <linux/dma-fence-unwrap.h>
 #include <linux/dma-resv.h>
 #include "legion_export_state.h"
 #define NVGPU_MAX_WAIT_INPUTS 32
@@ -238,54 +239,61 @@ static long nvgpu_sync_wait(struct nvgpu_fd *nfd, struct drm_file *file,
   fence = sync_file_get_fence(params.fd);
   if (!fence)
     goto put_object;
-  /* Keep the existing one-ioctl path for directly reusable native fences, including already-completed owned inputs. */
-  if (rcu_access_pointer(fence->ops) == &nvgpu_sync_ops) {
-    ret = nvgpu_sync_input_token(nfd, fence, &token);
-    if (!ret)
-      goto single_input;
-    if (!dma_fence_is_signaled(fence))
-      goto put_input;
-  }
-  if (dma_fence_is_signaled(fence)) {
+  ret = dma_fence_get_status(fence);
+  if (ret < 0)
+    goto put_input;
+  if (ret > 0) {
     ret = nvgpu_sync_completed_wait(nfd, context, params.pre, params.post);
     goto put_input;
   }
-  if (dma_fence_is_array(fence)) {
+  {
+    struct dma_fence_unwrap cursor;
     struct dma_fence *leaf;
-    unsigned int index, count = 0;
-    if (to_dma_fence_array(fence)->num_fences > NVGPU_MAX_WAIT_INPUTS) {
-      ret = -E2BIG;
-      goto put_input;
-    }
-    dma_fence_array_for_each(leaf, index, fence) {
-      if (dma_fence_is_signaled(leaf))
-        continue;
-      if (count == NVGPU_MAX_WAIT_INPUTS) {
+    unsigned int count = 0, visited = 0;
+    /* Timeline exports can wrap owned leaves in chains and arrays. */
+    dma_fence_unwrap_for_each(leaf, &cursor, fence) {
+      if (++visited > NVGPU_MAX_WAIT_INPUTS) {
         ret = -E2BIG;
+        dma_fence_put(cursor.chain);
         goto put_input;
       }
-      ret = nvgpu_sync_input_token(nfd, leaf, &token);
-      if (ret)
+      ret = dma_fence_get_status(leaf);
+      if (ret < 0) {
+        dma_fence_put(cursor.chain);
         goto put_input;
+      }
+      if (ret > 0)
+        continue;
+      ret = nvgpu_sync_input_token(nfd, leaf, &token);
+      if (ret) {
+        dma_fence_put(cursor.chain);
+        goto put_input;
+      }
       put_unaligned_le64(token, many + 32 + count * 8);
       count++;
+    }
+    dma_fence_put(cursor.chain);
+    if (!visited) {
+      ret = -EINVAL;
+      goto put_input;
     }
     if (!count) {
       ret = nvgpu_sync_completed_wait(nfd, context, params.pre, params.post);
       goto put_input;
     }
+    if (count == 1) {
+      token = get_unaligned_le64(many + 32);
+      goto single_input;
+    }
     put_unaligned_le32(context->host_handle, many);
     put_unaligned_le32(count, many + 4);
     put_unaligned_le64(params.pre, many + 8);
     put_unaligned_le64(params.post, many + 16);
-    /* The counted array reference retains every leaf and its host token until the backend has installed a native merged-fence wait. */
+    /* Retain every leaf until the native merged wait has been installed. */
     ret = nvgpu_ioctl_flat_h(nfd->dev, nfd->handle, 0x41204c28, many,
                             sizeof(many));
     goto put_input;
   }
-  ret = nvgpu_sync_input_token(nfd, fence, &token);
-  if (ret)
-    goto put_input;
 single_input:
   put_unaligned_le32(context->host_handle, request);
   put_unaligned_le64(token, request + 8);
@@ -295,6 +303,8 @@ single_input:
   ret = nvgpu_ioctl_flat_h(nfd->dev, nfd->handle, 0x40204c27, request,
                           sizeof(request));
 put_input:
+  if (ret < 0)
+    dev_warn_ratelimited(&nfd->dev->vdev->dev, "sync dependency rejected: %ld\n", ret);
   dma_fence_put(fence);
 put_object:
   drm_gem_object_put(object);
@@ -462,7 +472,8 @@ static long nvgpu_sync_create(struct nvgpu_fd *nfd, struct drm_file *file,
   if (context->owner_handle != nfd->handle) { ret = -EXDEV; goto put_object; }
   fd = get_unused_fd_flags(O_CLOEXEC);
   if (fd < 0) { ret = fd; goto put_object; }
-  nf = nvgpu_sync_export(nfd, file, context, params.timeout, params.wait, false);
+  /* Completed proxies must not pin their owning DRM syncobj table. */
+  nf = nvgpu_sync_export(nfd, file, context, params.timeout, params.wait, true);
   if (IS_ERR(nf)) { ret = PTR_ERR(nf); goto put_fd; }
   sync = sync_file_create(&nf->base);
   if (!sync) {
@@ -518,6 +529,7 @@ static long nvgpu_sync_attach(struct nvgpu_fd *nfd, struct drm_file *file,
   if (ret) goto put_context;
   ret = dma_resv_reserve_fences(buffer->resv, 1);
   if (ret) goto unlock;
+  /* Completed proxies must not pin their owning DRM syncobj table. */
   nf = nvgpu_sync_export(nfd, file, context, params.timeout, params.wait, true);
   if (IS_ERR(nf)) { ret = PTR_ERR(nf); goto unlock; }
   put_unaligned_le32(to_nvgpu_gem(buffer)->host_handle, request);

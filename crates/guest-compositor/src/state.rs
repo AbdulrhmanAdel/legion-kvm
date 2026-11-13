@@ -45,6 +45,9 @@ use std::os::fd::OwnedFd;
 
 pub struct State {
     compositor: CompositorState,
+    syncobj: Option<smithay::wayland::drm_syncobj::DrmSyncobjState>,
+    pending_sync: Option<crate::syncobj::Release>,
+    acquire_watches: Vec<crate::syncobj::Watch>,
     xdg: XdgShellState,
     pub(crate) xwayland_shell: smithay::wayland::xwayland_shell::XWaylandShellState,
     pub(crate) xwm: Option<smithay::xwayland::X11Wm>,
@@ -87,6 +90,65 @@ pub struct State {
     pointer_height: i32,
 }
 impl State {
+    pub(crate) fn enable_explicit_sync(
+        &mut self,
+        dh: &DisplayHandle,
+        file: std::fs::File,
+    ) -> Result<bool> {
+        use smithay::{
+            backend::drm::DrmDeviceFd,
+            utils::DeviceFd,
+            wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
+        };
+        let device = DrmDeviceFd::new(DeviceFd::from(OwnedFd::from(file)));
+        if !supports_syncobj_eventfd(&device) {
+            return Ok(false);
+        }
+        crate::syncobj::verify_device(&device).context("qualify guest timeline operations")?;
+        self.syncobj = Some(DrmSyncobjState::new::<Self>(dh, device));
+        Ok(true)
+    }
+    pub(crate) fn acquire_pending_release(&mut self) -> Option<crate::syncobj::Release> {
+        self.pending_sync.take()
+    }
+    pub(crate) fn discard_pending(&mut self) {
+        if let Some(buffer) = self.pending.take() {
+            let sync = self.pending_sync.take();
+            self.discard_buffer(buffer, sync);
+        }
+    }
+    fn discard_buffer(&mut self, buffer: WlBuffer, sync: Option<crate::syncobj::Release>) {
+        if let Some(sync) = sync
+            && let Err(error) = sync.signal()
+        {
+            self.error = Some(error.to_string());
+        }
+        if buffer.is_alive() {
+            buffer.release();
+        }
+    }
+    pub(crate) fn poll_explicit_sync(&mut self, dh: &DisplayHandle) -> Result<()> {
+        let mut ready = Vec::new();
+        let mut index = 0;
+        while index < self.acquire_watches.len() {
+            if self.acquire_watches[index].ready()? {
+                ready.push(self.acquire_watches.swap_remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        for watch in ready {
+            watch.release();
+            if let Some(client) = watch.surface.client() {
+                self.client_compositor_state(&client)
+                    .blocker_cleared(self, dh);
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn pending_sync_acquires(&self) -> usize {
+        self.acquire_watches.len()
+    }
     pub fn close_clients(&self) {
         for surface in self.xdg.toplevel_surfaces() {
             surface.send_close();
@@ -157,6 +219,9 @@ impl State {
         output.create_global::<Self>(dh);
         Ok(Self {
             compositor: CompositorState::new::<Self>(dh),
+            syncobj: None,
+            pending_sync: None,
+            acquire_watches: Vec::new(),
             xdg: XdgShellState::new::<Self>(dh),
             xwayland_shell: smithay::wayland::xwayland_shell::XWaylandShellState::new::<Self>(dh),
             xwm: None,
@@ -222,9 +287,9 @@ impl State {
             self.presentation_root = Some(root);
             changed = true;
             self.presentation_switches += 1;
-            if let Some(buffer) = self.pending.take() {
+            if self.pending.is_some() {
                 self.discarded_on_selection_change += 1;
-                buffer.release();
+                self.discard_pending();
             }
         }
         self.ordered_input.selected = Some(focus.clone());
@@ -243,9 +308,9 @@ impl State {
         self.presentation_root = None;
         self.ordered_input.selected = None;
         self.input_window_changed();
-        if let Some(buffer) = self.pending.take() {
+        if self.pending.is_some() {
             self.discarded_on_selection_change += 1;
-            buffer.release();
+            self.discard_pending();
         }
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
@@ -256,10 +321,10 @@ impl State {
             .as_ref()
             .is_none_or(|selected| selected == root)
     }
-    fn discard_inactive(&mut self, buffer: WlBuffer) {
+    fn discard_inactive(&mut self, buffer: WlBuffer, sync: Option<crate::syncobj::Release>) {
         self.source_commits += 1;
         self.inactive_surface_buffers += 1;
-        buffer.release();
+        self.discard_buffer(buffer, sync);
     }
     fn apply_input(&mut self, input: Input, time: u32, toggle: bool) {
         if input.generation() == self.last_input.generation() {
@@ -330,11 +395,16 @@ impl State {
             self.last_input = input;
         }
     }
-    fn accept_buffer(&mut self, buffer: WlBuffer, surface: Option<WlSurface>) {
+    fn accept_buffer(
+        &mut self,
+        buffer: WlBuffer,
+        surface: Option<WlSurface>,
+        sync: Option<crate::syncobj::Release>,
+    ) {
         self.source_commits += 1;
         if self.gpu_only && smithay::wayland::dmabuf::get_dmabuf(&buffer).is_err() {
             self.shm_skipped += 1;
-            buffer.release();
+            self.discard_buffer(buffer, sync);
             return;
         }
         if self.diagnose_surfaces {
@@ -343,8 +413,10 @@ impl State {
         }
         if let Some(old) = self.pending.replace(buffer) {
             self.superseded += 1;
-            old.release();
+            let old_sync = self.pending_sync.take();
+            self.discard_buffer(old, old_sync);
         }
+        self.pending_sync = sync;
     }
     pub fn surface_diagnostics(&self) -> serde_json::Value {
         let roots = self.xdg.toplevel_surfaces();
@@ -416,6 +488,25 @@ impl State {
 }
 delegate_viewporter!(State);
 impl CompositorHandler for State {
+    fn new_surface(&mut self, surface: &WlSurface) {
+        if self.syncobj.is_some() {
+            smithay::wayland::compositor::add_pre_commit_hook::<Self, _>(
+                surface,
+                |state, _, surface| {
+                    if state.acquire_watches.len() >= 1024 {
+                        state.error = Some("too many pending acquire timelines".into());
+                        return;
+                    }
+                    match crate::syncobj::Watch::pending(surface) {
+                        Ok(Some(watch)) => state.acquire_watches.push(watch),
+                        Ok(None) => {}
+                        Err(error) => state.error = Some(error.to_string()),
+                    }
+                },
+            );
+        }
+    }
+
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor
     }
@@ -431,6 +522,7 @@ impl CompositorHandler for State {
     fn commit(&mut self, surface: &WlSurface) {
         if self.gpu_only {
             let diagnose = self.diagnose_surfaces;
+            let explicit_sync = self.syncobj.is_some();
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {
                 root = parent;
@@ -450,16 +542,21 @@ impl CompositorHandler for State {
                         .buffer
                         .take()
                     {
-                        buffers.push((buffer, diagnose.then(|| surface.clone())));
+                        let sync = if explicit_sync {
+                            crate::syncobj::take_release(states)
+                        } else {
+                            Ok(None)
+                        };
+                        buffers.push((buffer, diagnose.then(|| surface.clone()), sync));
                     }
                 },
                 |_, _, _| true,
             );
-            for (buffer, surface) in buffers {
-                if selected {
-                    self.accept_buffer(buffer, surface);
-                } else {
-                    self.discard_inactive(buffer);
+            for (buffer, surface, sync) in buffers {
+                match sync {
+                    Ok(sync) if selected => self.accept_buffer(buffer, surface, sync),
+                    Ok(sync) => self.discard_inactive(buffer, sync),
+                    Err(error) => self.error = Some(error.to_string()),
                 }
             }
             return;
@@ -478,9 +575,13 @@ impl CompositorHandler for State {
                 root = parent;
             }
             if self.accepts_root(&root) {
-                self.accept_buffer(buffer, self.diagnose_surfaces.then(|| surface.clone()));
+                self.accept_buffer(
+                    buffer,
+                    self.diagnose_surfaces.then(|| surface.clone()),
+                    None,
+                );
             } else {
-                self.discard_inactive(buffer);
+                self.discard_inactive(buffer, None);
             }
         }
     }
@@ -600,3 +701,10 @@ delegate_xdg_shell!(State);
 delegate_seat!(State);
 delegate_output!(State);
 delegate_data_device!(State);
+
+impl smithay::wayland::drm_syncobj::DrmSyncobjHandler for State {
+    fn drm_syncobj_state(&mut self) -> Option<&mut smithay::wayland::drm_syncobj::DrmSyncobjState> {
+        self.syncobj.as_mut()
+    }
+}
+smithay::delegate_drm_syncobj!(State);

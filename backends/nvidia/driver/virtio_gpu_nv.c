@@ -333,13 +333,12 @@ struct nvgpu_device;
 static int nvgpu_claim_alloc = 1;
 module_param_named(claim_alloc, nvgpu_claim_alloc, int, 0444);
 MODULE_PARM_DESC(claim_alloc, "GET_DEV_INFO reports supports_alloc");
-/* supports_sync_fd stays off: PRIME_FENCE_CONTEXT_CREATE and GEM_PRIME_FENCE_ATTACH (0x05, 0x06) are still not forwarded. */
-/* Private correctness probe only; no Linux sync-file proxy is advertised. */
-static int nvgpu_fence_probe;
+/* Semaphore fences use verified host completions. */
+static int nvgpu_fence_probe = 1;
 module_param_named(fence_probe, nvgpu_fence_probe, int, 0444);
-MODULE_PARM_DESC(fence_probe, "enable private index-zero semaphore fence probe");
+MODULE_PARM_DESC(fence_probe, "enable semaphore fence transport");
 
-static int nvgpu_claim_sync_fd;
+static int nvgpu_claim_sync_fd = 1;
 module_param_named(claim_sync_fd, nvgpu_claim_sync_fd, int, 0444);
 MODULE_PARM_DESC(claim_sync_fd, "GET_DEV_INFO reports supports_sync_fd");
 
@@ -705,6 +704,11 @@ struct drm_nvidia_get_dev_info_params {
   __u32 supports_semsurf;
 } __packed;
 
+static bool nvgpu_supports_timeline(struct nvgpu_dri_dev *dri) {
+  return nvgpu_fence_probe && nvgpu_claim_sync_fd &&
+         dri->dev_info[7] == 1 && dri->dev_info[8] == 1;
+}
+
 /* nvgpu_drm_handle_ioctl — handle all DRM-layer ioctls on our /dev/dri/.. nodes. */
 static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
                                    struct nvgpu_dri_dev *dri,
@@ -769,8 +773,8 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
 
     /* The three capability bits are the host's answer about the host's node, and this node is not that node: it answers four ioctls and forwards nothing else. */
     info[3] = nvgpu_claim_alloc;   /* supports_alloc */
-    info[7] = nvgpu_claim_sync_fd; /* supports_sync_fd */
-    info[8] = 0;
+    info[7] = nvgpu_supports_timeline(dri);
+    info[8] = nvgpu_supports_timeline(dri);
 
     /* primary_index is the number of the DRM node this device is, and it has to be *ours*. */
     if (file && file->minor && file->minor->dev && file->minor->dev->primary)
@@ -4062,7 +4066,7 @@ static const struct file_operations nvgpu_drm_fops = {
 };
 
 static const struct drm_driver nvgpu_drm_driver = {
-    .driver_features = DRIVER_GEM | DRIVER_RENDER,
+    .driver_features = DRIVER_GEM | DRIVER_RENDER | DRIVER_SYNCOBJ | DRIVER_SYNCOBJ_TIMELINE,
     /* Without this, a buffer this node exported cannot be imported back. */
     .gem_prime_import = nvgpu_gem_prime_import,
     .open = nvgpu_drm_open,
@@ -4147,6 +4151,8 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
       continue;
     }
     drm->dev_private = dri;
+    if (!nvgpu_supports_timeline(dri))
+      drm->driver_features &= ~(DRIVER_SYNCOBJ | DRIVER_SYNCOBJ_TIMELINE);
 
     if (drm_dev_register(drm, 0) != 0) {
       dev_warn(&dev->vdev->dev, "virtio-gpu-nv: drm_dev_register %s failed\n",

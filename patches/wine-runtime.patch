@@ -1,0 +1,387 @@
+--- a/dlls/ntdll/heap.c
++++ b/dlls/ntdll/heap.c
+@@ -338,6 +338,47 @@
+ 
+ static struct heap *process_heap;  /* main process heap */
+ 
++/* Publish the real process heap list for clients reading the Windows PEB.
++ * Called under process_heap->cs after the main heap has been initialized.
++ * Old grown tables stay mapped until exit so readers cannot use freed storage. */
++static HANDLE DECLSPEC_ALIGN(4096) initial_process_heaps[512];
++static HANDLE *peb_process_heaps = initial_process_heaps;
++static ULONG peb_heap_capacity = ARRAY_SIZE(initial_process_heaps);
++
++static BOOL update_peb_process_heaps(void)
++{
++    PEB *peb = NtCurrentTeb()->Peb;
++    struct list *ptr;
++    ULONG total = 1, i = 1;
++    HANDLE *table = peb_process_heaps;
++
++    LIST_FOR_EACH(ptr, &process_heap->entry) total++;
++    if (total > peb_heap_capacity)
++    {
++        ULONG capacity = peb_heap_capacity;
++        SIZE_T size;
++        while (capacity < total)
++        {
++            if (capacity > ~0u / 2) return FALSE;
++            capacity *= 2;
++        }
++        size = (SIZE_T)capacity * sizeof(*table);
++        table = NULL;
++        if (NtAllocateVirtualMemory(NtCurrentProcess(), (void **)&table, 0, &size,
++                                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) return FALSE;
++        peb_process_heaps = table;
++        peb_heap_capacity = capacity;
++    }
++    table[0] = process_heap;
++    LIST_FOR_EACH(ptr, &process_heap->entry)
++        table[i++] = LIST_ENTRY(ptr, struct heap, entry);
++    InterlockedExchangePointer((void **)&peb->ProcessHeaps, table);
++    peb->MaximumNumberOfHeaps = peb_heap_capacity;
++    peb->NumberOfHeaps = total;
++    return TRUE;
++}
++
++
+ static NTSTATUS heap_free_block_lfh( struct heap *heap, ULONG flags, struct block *block );
+ 
+ /* check if memory range a contains memory range b */
+@@ -1602,12 +1643,21 @@
+     {
+         RtlEnterCriticalSection( &process_heap->cs );
+         list_add_head( &process_heap->entry, &heap->entry );
++        if (!update_peb_process_heaps())
++        {
++            list_remove( &heap->entry );
++            list_init( &heap->entry );
++            RtlLeaveCriticalSection( &process_heap->cs );
++            RtlDestroyHeap( heap );
++            return NULL;
++        }
+         RtlLeaveCriticalSection( &process_heap->cs );
+     }
+     else if (!addr)
+     {
+         process_heap = heap;  /* assume the first heap we create is the process main heap */
+         list_init( &process_heap->entry );
++        update_peb_process_heaps();
+     }
+ 
+     return heap;
+@@ -1663,6 +1713,7 @@
+     /* remove it from the per-process list */
+     RtlEnterCriticalSection( &process_heap->cs );
+     list_remove( &heap->entry );
++    update_peb_process_heaps();
+     RtlLeaveCriticalSection( &process_heap->cs );
+ 
+     heap->cs.DebugInfo->Spare[0] = 0;
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -181,6 +181,54 @@
+     { &ldr.InMemoryOrderModuleList, &ldr.InMemoryOrderModuleList },
+     { &ldr.InInitializationOrderModuleList, &ldr.InInitializationOrderModuleList }
+ };
++
++/* Opt-in private loader bookkeeping for compatibility experiments where
++ * application code replaces the public PEB loader-data pointer. */
++static unsigned int private_loader_data;
++static PEB_LDR_DATA *canonical_loader_data = &ldr;
++static NTSTATUS (WINAPI *gate_thread_start)(void);
++static NTSTATUS (WINAPI *gate_thread_finish)(void);
++static PEB_LDR_DATA *loader_data(void)
++{
++    PEB_LDR_DATA *public_data = NtCurrentTeb()->Peb->LdrData;
++    LIST_ENTRY *old_heads[3], *new_heads[3];
++    unsigned int i;
++
++    if (private_loader_data == 1) return &ldr;
++    if (private_loader_data != 2) return public_data;
++    if (public_data == canonical_loader_data) return public_data;
++    if (!public_data) return canonical_loader_data;
++
++    old_heads[0] = &canonical_loader_data->InLoadOrderModuleList;
++    old_heads[1] = &canonical_loader_data->InMemoryOrderModuleList;
++    old_heads[2] = &canonical_loader_data->InInitializationOrderModuleList;
++    new_heads[0] = &public_data->InLoadOrderModuleList;
++    new_heads[1] = &public_data->InMemoryOrderModuleList;
++    new_heads[2] = &public_data->InInitializationOrderModuleList;
++    /* Loader callers hold loader_section. Validate every shallow-copied
++     * head before changing any links; unrelated replacement lists stay
++     * untouched and the existing canonical bookkeeping remains usable. */
++    for (i = 0; i < 3; ++i)
++    {
++        LIST_ENTRY *old = old_heads[i], *copy = new_heads[i];
++        if (!old->Flink || !old->Blink || copy->Flink != old->Flink || copy->Blink != old->Blink ||
++            old->Flink->Blink != old || old->Blink->Flink != old)
++            return canonical_loader_data;
++    }
++    for (i = 0; i < 3; ++i)
++    {
++        LIST_ENTRY *old = old_heads[i], *copy = new_heads[i];
++        if (old->Flink == old) InitializeListHead( copy );
++        else
++        {
++            copy->Flink->Blink = copy;
++            copy->Blink->Flink = copy;
++        }
++    }
++    canonical_loader_data = public_data;
++    TRACE_(loaddll)( "validated canonical public loader lists at %p\n", public_data );
++    return public_data;
++}
+ 
+ static RTL_RB_TREE base_address_index_tree;
+ 
+@@ -654,7 +702,7 @@
+     if (cached_modref && RtlEqualUnicodeString( &name, &cached_modref->ldr.FullDllName, TRUE ))
+         return cached_modref;
+ 
+-    mark = &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList;
++    mark = &loader_data()->InLoadOrderModuleList;
+     for (entry = mark->Flink; entry != mark; entry = entry->Flink)
+     {
+         LDR_DATA_TABLE_ENTRY *mod = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+@@ -680,7 +728,7 @@
+ 
+     if (cached_modref && !memcmp( &cached_modref->id, id, sizeof(*id) )) return cached_modref;
+ 
+-    mark = &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList;
++    mark = &loader_data()->InLoadOrderModuleList;
+     for (entry = mark->Flink; entry != mark; entry = entry->Flink)
+     {
+         LDR_DATA_TABLE_ENTRY *mod = CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks );
+@@ -1668,9 +1716,9 @@
+             wm->ldr.EntryPoint = (char *)hModule + nt->OptionalHeader.AddressOfEntryPoint;
+     }
+ 
+-    InsertTailList(&NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList,
++    InsertTailList(&loader_data()->InLoadOrderModuleList,
+                    &wm->ldr.InLoadOrderLinks);
+-    InsertTailList(&NtCurrentTeb()->Peb->LdrData->InMemoryOrderModuleList,
++    InsertTailList(&loader_data()->InMemoryOrderModuleList,
+                    &wm->ldr.InMemoryOrderLinks);
+     InsertTailList(&hash_table[hash_basename( &wm->ldr.BaseDllName )], &wm->ldr.HashLinks);
+     if (rtl_rb_tree_put( &base_address_index_tree, wm->ldr.DllBase, &wm->ldr.BaseAddressIndexNode, base_address_compare ))
+@@ -1768,6 +1816,18 @@
+     DLLENTRYPROC entry = wm->ldr.EntryPoint;
+     void *module = wm->ldr.DllBase;
+     BOOL retv = FALSE;
++
++    /* Public loader lists may contain application-owned metadata copies.
++     * Only the node registered in Wine's private address index owns a DLL
++     * lifecycle. A copied entry point must not attach or detach it twice. */
++    if (private_loader_data == 2 &&
++        rtl_rb_tree_get( &base_address_index_tree, module, base_address_compare ) !=
++        &wm->ldr.BaseAddressIndexNode)
++    {
++        TRACE_(loaddll)( "skipping public-only lifecycle metadata %p module %p entry %p reason %s\n",
++                        wm, module, entry, reason_names[reason] );
++        return STATUS_SUCCESS;
++    }
+ 
+     /* Skip calls for modules loaded with special load flags */
+ 
+@@ -1876,7 +1936,7 @@
+     status = walk_node_dependencies( node, lpReserved, process_attach );
+ 
+     if (!wm->ldr.InInitializationOrderLinks.Flink)
+-        InsertTailList(&NtCurrentTeb()->Peb->LdrData->InInitializationOrderModuleList,
++        InsertTailList(&loader_data()->InInitializationOrderModuleList,
+                 &wm->ldr.InInitializationOrderLinks);
+ 
+     /* Call DLL entry point */
+@@ -1919,7 +1979,7 @@
+     PLIST_ENTRY mark, entry;
+     PLDR_DATA_TABLE_ENTRY mod;
+ 
+-    mark = &NtCurrentTeb()->Peb->LdrData->InInitializationOrderModuleList;
++    mark = &loader_data()->InInitializationOrderModuleList;
+     do
+     {
+         for (entry = mark->Blink; entry != mark; entry = entry->Blink)
+@@ -1957,7 +2017,7 @@
+     PLIST_ENTRY mark, entry;
+     PLDR_DATA_TABLE_ENTRY mod;
+ 
+-    mark = &NtCurrentTeb()->Peb->LdrData->InInitializationOrderModuleList;
++    mark = &loader_data()->InInitializationOrderModuleList;
+     for (entry = mark->Flink; entry != mark; entry = entry->Flink)
+     {
+         mod = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY,
+@@ -2035,7 +2095,7 @@
+ 
+     RtlEnterCriticalSection( &loader_section );
+ 
+-    mark = &NtCurrentTeb()->Peb->LdrData->InMemoryOrderModuleList;
++    mark = &loader_data()->InMemoryOrderModuleList;
+     for (entry = mark->Flink; entry != mark; entry = entry->Flink)
+     {
+         mod = CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks );
+@@ -2926,7 +2986,7 @@
+ 
+     if ((wm = get_modref( module ))) return wm;
+ 
+-    mark = &NtCurrentTeb()->Peb->LdrData->InMemoryOrderModuleList;
++    mark = &loader_data()->InMemoryOrderModuleList;
+     for (entry = mark->Flink; entry != mark; entry = entry->Flink)
+     {
+         mod = CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks );
+@@ -3894,7 +3954,7 @@
+     smi->ModulesCount = 0;
+ 
+     RtlEnterCriticalSection( &loader_section );
+-    mark = &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList;
++    mark = &loader_data()->InLoadOrderModuleList;
+     for (entry = mark->Flink; entry != mark; entry = entry->Flink)
+     {
+         mod = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+@@ -4158,7 +4218,7 @@
+     if (!NtCurrentTeb()->SkipThreadAttach)
+     {
+         wm = get_modref( NtCurrentTeb()->Peb->ImageBaseAddress );
+-        mark = &NtCurrentTeb()->Peb->LdrData->InInitializationOrderModuleList;
++        mark = &loader_data()->InInitializationOrderModuleList;
+         for (entry = mark->Blink; entry != mark; entry = entry->Blink)
+         {
+             mod = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY,
+@@ -4195,6 +4255,11 @@
+     RtlFreeThreadActivationContextStack();
+ 
+     heap_thread_detach();
++    if (gate_thread_finish)
++    {
++        NTSTATUS status = gate_thread_finish();
++        if (status) NtTerminateThread( GetCurrentThread(), status );
++    }
+ }
+ 
+ 
+@@ -4261,7 +4326,7 @@
+     LDR_DATA_TABLE_ENTRY *mod;
+     WINE_MODREF*wm;
+ 
+-    mark = &NtCurrentTeb()->Peb->LdrData->InInitializationOrderModuleList;
++    mark = &loader_data()->InInitializationOrderModuleList;
+     for (entry = mark->Blink; entry != mark; entry = prev)
+     {
+         mod = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InInitializationOrderLinks);
+@@ -4271,7 +4336,7 @@
+     }
+ 
+     /* check load order list too for modules that haven't been initialized yet */
+-    mark = &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList;
++    mark = &loader_data()->InLoadOrderModuleList;
+     for (entry = mark->Blink; entry != mark; entry = prev)
+     {
+         mod = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+@@ -4636,6 +4701,11 @@
+     ULONG_PTR cookie, port = 0;
+     WINE_MODREF *wm;
+ 
++    /* Native TEB preparation is complete. Even the first loader-lock wait
++     * can enter a registered handler, before static DLL TLS is allocated. */
++    if (gate_thread_start && (status = gate_thread_start()))
++        NtTerminateThread( GetCurrentThread(), status );
++
+     if (process_detaching) NtTerminateThread( GetCurrentThread(), 0 );
+ 
+     if (NtCurrentTeb()->SkipLoaderInit) return;
+@@ -4775,6 +4845,55 @@
+             ERR( "Initializing system dll for %s failed, status %lx\n",
+                  debugstr_w(NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer), status );
+             NtTerminateProcess( GetCurrentProcess(), status );
++        }
++
++        /* Opt-in owned compatibility bootstrap, after the core runtime is
++         * initialized and before application dependency TLS/DllMain. */
++        {
++            UNICODE_STRING bootstrap = {0}, loader_mode = {0};
++            WINE_MODREF *bridge;
++            NTSTATUS boot_status = get_env_var( L"WINE_GATE_PRIVATE_LOADER", 0, &loader_mode );
++            if (!boot_status)
++            {
++                if (loader_mode.Length == sizeof(WCHAR) &&
++                    (loader_mode.Buffer[0] == '1' || loader_mode.Buffer[0] == '2'))
++                    private_loader_data = loader_mode.Buffer[0] - '0';
++                RtlFreeHeap( GetProcessHeap(), 0, loader_mode.Buffer );
++            }
++            else if (boot_status != STATUS_VARIABLE_NOT_FOUND)
++                NtTerminateProcess( GetCurrentProcess(), boot_status );
++            boot_status = get_env_var( L"WINE_GATE_BOOTSTRAP_DLL", 0, &bootstrap );
++            if (!boot_status)
++            {
++                boot_status = load_dll( NULL, bootstrap.Buffer, 0, &bridge, FALSE );
++                RtlFreeHeap( GetProcessHeap(), 0, bootstrap.Buffer );
++                if (!boot_status) boot_status = process_attach( bridge->ldr.DdagNode, context );
++                if (!boot_status)
++                {
++                    ANSI_STRING name = RTL_CONSTANT_STRING("owned_loader_thread_start");
++                    void *callback = NULL;
++                    if (!LdrGetProcedureAddress( bridge->ldr.DllBase, &name, 0, &callback ))
++                    {
++                        ANSI_STRING finish_name = RTL_CONSTANT_STRING("owned_loader_thread_finish");
++                        ANSI_STRING setup_name = RTL_CONSTANT_STRING("owned_loader_set_thread_lifecycle");
++                        void *finish = NULL, *setup = NULL;
++                        gate_thread_start = callback;
++                        if (!LdrGetProcedureAddress( bridge->ldr.DllBase, &finish_name, 0, &finish ) &&
++                            !LdrGetProcedureAddress( bridge->ldr.DllBase, &setup_name, 0, &setup ))
++                        {
++                            boot_status = ((NTSTATUS (WINAPI *)(BOOL))setup)(TRUE);
++                            if (!boot_status) gate_thread_finish = finish;
++                        }
++                    }
++                }
++                if (boot_status)
++                {
++                    ERR( "Compatibility bootstrap failed, status %lx\n", boot_status );
++                    NtTerminateProcess( GetCurrentProcess(), boot_status );
++                }
++            }
++            else if (boot_status != STATUS_VARIABLE_NOT_FOUND)
++                NtTerminateProcess( GetCurrentProcess(), boot_status );
+         }
+ 
+         if ((status = walk_node_dependencies( wm->ldr.DdagNode, context, process_attach )))
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -527,11 +527,14 @@
+                                               (1 << XSTATE_AVX512_ZMM_H) | (1 << XSTATE_AVX512_ZMM);
+     ULONG64 supported_mask;
+     unsigned int i, off, regs[4];
++    const char *gate_xstate = getenv("WINE_GATE_XSTATE7");
++    BOOL restricted = gate_xstate && !strcmp(gate_xstate, "1");
+ 
+     do_cpuid( 0x0000000d, 0, regs );
+     TRACE( "XSAVE details %#x, %#x, %#x, %#x.\n", regs[0], regs[1], regs[2], regs[3] );
+     supported_mask = ((ULONG64)regs[3] << 32) | regs[0];
+     supported_mask &= do_xgetbv(0) & supported_features;
++    if (restricted) supported_mask &= 7;
+ 
+     xstate->EnabledFeatures = (1 << XSTATE_LEGACY_FLOATING_POINT) | (1 << XSTATE_LEGACY_SSE) | supported_mask;
+     xstate->EnabledVolatileFeatures = xstate->EnabledFeatures;
+@@ -564,6 +567,9 @@
+                xstate->Features[i].Offset, xstate->Features[i].Size, !!(regs[2] & 2) );
+     }
+ 
++    /* The Windows stream uses the restricted KVM XCR0; Linux code retains
++     * its native CPU state. Publish the enabled Windows layout at startup. */
++    if (restricted) xstate->AllFeatureSize = off;
+     xstate->Size = xstate->CompactionEnabled ? off :
+            offsetof( XSAVE_FORMAT, XmmRegisters ) + xstate->Features[i - 1].Offset + xstate->Features[i - 1].Size;
+     TRACE( "xstate size %x, compacted %d, optimized %d.\n",
+@@ -623,7 +629,12 @@
+     }
+ 
+     if (features[PF_XSAVE_ENABLED])
++    {
++        const char *gate_xstate = getenv("WINE_GATE_XSTATE7");
+         init_xstate_features( &data->XState );
++        if (gate_xstate && !strcmp(gate_xstate, "1"))
++            features[PF_AVX512F_INSTRUCTIONS_AVAILABLE] = FALSE;
++    }
+ }
+ 
+ #elif defined(__arm__) || defined(__aarch64__)
