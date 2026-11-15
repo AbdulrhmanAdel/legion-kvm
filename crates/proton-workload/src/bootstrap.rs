@@ -31,12 +31,14 @@ mod linux {
         #[default]
         Nvidia,
         Radv,
+        Venus,
     }
     impl VulkanDriver {
         fn icd(&self) -> &'static str {
             match self {
                 Self::Nvidia => "/usr/share/vulkan/icd.d/nvidia_icd.json",
                 Self::Radv => "/usr/share/vulkan/icd.d/radeon_icd.json",
+                Self::Venus => "/usr/share/vulkan/icd.d/virtio_icd.json",
             }
         }
     }
@@ -371,7 +373,7 @@ mod linux {
             }).collect()
         }
 
-        fn start(exit_trace: bool) -> Result<Self> {
+        fn start(exit_trace: bool, capture_crashes: bool) -> Result<Self> {
             if exit_trace {
                 enable_guest_trace()?;
             }
@@ -382,6 +384,29 @@ mod linux {
                 let mut traced_owner = 0;
                 let mut captured_owner = 0;
                 loop {
+                    if capture_crashes {
+                        // Diagnostic runs only, inside the disposable guest. UE may
+                        // leave its useful crash context in tmpfs rather than Saved.
+                        let mut pending = vec![(std::path::PathBuf::from("/tmp"), 0)];
+                        let mut visited = 0;
+                        while let Some((path, depth)) = pending.pop() {
+                            if visited >= 512 { break; }
+                            let Ok(entries) = fs::read_dir(&path) else { continue; };
+                            for entry in entries.flatten().take(128) {
+                                visited += 1;
+                                let Ok(kind) = entry.file_type() else { continue; };
+                                if kind.is_dir() && depth < 6 {
+                                    pending.push((entry.path(), depth + 1));
+                                } else if kind.is_file()
+                                    && entry.file_name().to_string_lossy().contains("CrashContext")
+                                    && entry.metadata().is_ok_and(|m| m.len() > 0 && m.len() <= 4 * 1024 * 1024)
+                                {
+                                    let name = entry.path().to_string_lossy().replace('/', "_");
+                                    let _ = fs::copy(entry.path(), Path::new("/frames").join(name));
+                                }
+                            }
+                        }
+                    }
                     let mut threads = Vec::new();
                     let owner = fs::read("/frames/cpu-adapter-state.bin").ok().and_then(|data| {
                         data.get(8..16).and_then(|v|v.try_into().ok()).map(u64::from_le_bytes)
@@ -694,6 +719,17 @@ mod linux {
         bind(source, destination)
     }
 
+    fn startup_stage(stage: &str) -> Result<()> {
+        let value = serde_json::to_vec(&serde_json::json!({"schema":1,"stage":stage}))?;
+        for name in ["guest-stage.json", "startup-status.json"] {
+            let path = Path::new("/frames").join(name);
+            let temporary = path.with_extension("json.tmp");
+            fs::write(&temporary, &value)?;
+            fs::rename(temporary, path)?;
+        }
+        Ok(())
+    }
+
     pub fn run() -> Result<()> {
         let native = std::env::args().any(|arg| arg == "--native");
         let launch: Launch = serde_json::from_slice(&fs::read("/usr/share/legion/launch.json")?)?;
@@ -762,6 +798,7 @@ mod linux {
                 "mount setup is restricted to the disposable Legion guest"
             );
             prepare_guest_file_limits()?;
+            startup_stage("preparing-runtime")?;
             if let Some(spin_us) = launch.driver_rpc_spin_us {
                 ensure!(
                     spin_us <= 100,
@@ -1182,6 +1219,7 @@ mod linux {
             )?;
         }
         let runtime = format!("/run/user/{}", launch.uid);
+        startup_stage("starting-display")?;
         let server_log = fs::File::create("/frames/wayland.log")?;
         let mut server = Command::new("/usr/share/legion/compositor");
         server
@@ -1191,6 +1229,8 @@ mod linux {
                 } else {
                     "--proton-forward"
                 }
+            } else if matches!(launch.vulkan_driver, VulkanDriver::Venus) {
+                "--offscreen-protocol-server"
             } else {
                 "--offscreen-server"
             })
@@ -1453,7 +1493,15 @@ mod linux {
         if launch.kuser_worker && launch.application.is_none() {
             jobs.push(("kuser_before", "runinprefix", "workload.exe"));
         }
-        jobs.push(("workload", "runinprefix", "workload.exe"));
+        jobs.push((
+            "workload",
+            if launch.application.is_some() && launch.wine_overlay.is_none() {
+                "waitforexitandrun"
+            } else {
+                "runinprefix"
+            },
+            "workload.exe",
+        ));
         if launch.kuser_worker && launch.application.is_none() {
             jobs.push(("kuser_after", "runinprefix", "workload.exe"));
         }
@@ -1462,12 +1510,11 @@ mod linux {
             let adapter_phase = phase == "workload" || resolver_contract;
             println!("LEGION_PROTON_PHASE {phase}");
             if matches!(phase, "prefix_setup" | "workload") {
-                fs::write(
-                    "/frames/startup-status.json",
-                    serde_json::to_vec(&serde_json::json!({
-                        "schema":1,"stage":if phase=="prefix_setup" {"preparing-runtime"}else{"starting-application"}
-                    }))?,
-                )?;
+                startup_stage(if phase == "prefix_setup" {
+                    "preparing-runtime"
+                } else {
+                    "starting-application"
+                })?;
             }
             let start = Instant::now();
             let mut command = Command::new("/usr/bin/python3");
@@ -1485,6 +1532,7 @@ mod linux {
                 .current_dir("/frames")
                 .env_clear()
                 .env("PATH", "/usr/bin")
+                .env("PWD", "/frames")
                 .env("HOME", "/frames/home")
                 .env("XDG_RUNTIME_DIR", format!("/run/user/{}", launch.uid))
                 .env(
@@ -1509,7 +1557,7 @@ mod linux {
                 .env("SteamAppId", "0")
                 .env("SteamGameId", "0")
                 // runinprefix skips setup_prefix's transient graphics overrides.
-                .env("WINEDLLOVERRIDES", "dxgi,d3d12,d3d12core=n")
+                .env("WINEDLLOVERRIDES", "dxgi,d3d11,d3d12,d3d12core=n")
                 .env("LANG", "C.UTF-8")
                 .env(
                     "WINEDEBUG",
@@ -1538,13 +1586,13 @@ mod linux {
             if phase == "workload"
                 && let Some(application) = &launch.application
             {
+                let working_directory = executable
+                    .parent()
+                    .context("application directory missing")?;
                 command
                     .args(&application.arguments)
-                    .current_dir(
-                        executable
-                            .parent()
-                            .context("application directory missing")?,
-                    )
+                    .current_dir(working_directory)
+                    .env("PWD", working_directory)
                     .env(
                         "STEAM_COMPAT_INSTALL_PATH",
                         "/run/legion-shares/application",
@@ -1620,6 +1668,8 @@ mod linux {
                                     | "WINEDEBUG"
                                     | "LANG"
                                     | "LC_ALL"
+                                    | "VN_PERF"
+                                    | "VN_FEEDBACK_SPIN_US"
                                     | "LEGION_WORKLOAD_DIRECTORY"
                             )),
                     "unsupported forwarded game environment variable"
@@ -1818,7 +1868,10 @@ mod linux {
                 );
             }
             let snapshots = if launch.thread_snapshots && !native && phase == "workload" {
-                Some(ThreadSnapshots::start(launch.thread_exit_trace)?)
+                Some(ThreadSnapshots::start(
+                    launch.thread_exit_trace,
+                    launch.exception_trace,
+                )?)
             } else {
                 None
             };

@@ -18,6 +18,8 @@ pub(crate) enum Stage {
     Graphics,
     Booting,
     GuestReady,
+    CheckingVulkan,
+    StartingDisplay,
     PreparingRuntime,
     StartingApplication,
     DisplayReady,
@@ -32,6 +34,8 @@ impl Stage {
             Self::Graphics => "Starting graphics services…",
             Self::Booting => "Starting the virtual machine…",
             Self::GuestReady => "Virtual machine ready; preparing the application…",
+            Self::CheckingVulkan => "Checking guest Vulkan…",
+            Self::StartingDisplay => "Starting the guest display…",
             Self::PreparingRuntime => "Preparing Proton…",
             Self::StartingApplication => "Starting the application; waiting for its window…",
             Self::DisplayReady => "Application rendering started",
@@ -137,13 +141,23 @@ impl Progress {
         {
             match value["stage"].as_str() {
                 Some("preparing-runtime") => self.set(Stage::PreparingRuntime),
+                Some("starting-display") => self.set(Stage::StartingDisplay),
                 Some("starting-application") => self.set(Stage::StartingApplication),
                 _ => {}
             }
         }
+        if self.stage.is_none_or(|stage| stage < Stage::CheckingVulkan)
+            && let Ok(bytes) = fs::read(self.frames.join("guest-stage.json"))
+            && bytes.len() <= 4096
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && value["stage"] == "vulkaninfo"
+        {
+            self.set(Stage::CheckingVulkan);
+        }
         // The existing diagnostic proves the first GPU image was acquired by the forwarding path.
         if self.frames.join("vm-forward-first.rgba").is_file()
             || self.frames.join("gpu-frame-ready").is_file()
+            || self.frames.join("kms-first-frame.json").is_file()
         {
             self.set(Stage::DisplayReady);
         }

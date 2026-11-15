@@ -27,6 +27,9 @@ use windows::{
 type Result<T> = core::result::Result<T, String>;
 #[path = "cpu_audit.rs"]
 mod cpu_audit;
+#[cfg(feature = "d3d11-probe")]
+#[path = "dx11.rs"]
+mod dx11;
 #[path = "nt_audit.rs"]
 mod nt_audit;
 #[path = "pipeline.rs"]
@@ -393,6 +396,59 @@ impl Gpu {
         log(&format!(
             "adapter: {adapter_name} {vendor_id:04x}:{device_id:04x}"
         ));
+        let mut shader = D3D12_FEATURE_DATA_SHADER_MODEL::default();
+        let mut shader_query_succeeded = false;
+        // Older runtimes reject shader-model enums they do not recognize.
+        for requested in [
+            0x69, 0x68, 0x67, 0x66, 0x65, 0x64, 0x63, 0x62, 0x61, 0x60, 0x51,
+        ] {
+            shader.HighestShaderModel = D3D_SHADER_MODEL(requested);
+            // SAFETY: initialized output matches the selected feature and exact structure size.
+            if unsafe {
+                device.CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    (&mut shader as *mut D3D12_FEATURE_DATA_SHADER_MODEL).cast(),
+                    core::mem::size_of_val(&shader) as u32,
+                )
+            }
+            .is_ok()
+            {
+                shader_query_succeeded = true;
+                break;
+            }
+        }
+        if !shader_query_succeeded {
+            return Err("shader model capabilities unavailable".into());
+        }
+        let levels = [
+            windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_2,
+            windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_1,
+            D3D_FEATURE_LEVEL_12_0,
+        ];
+        let mut level = D3D12_FEATURE_DATA_FEATURE_LEVELS {
+            NumFeatureLevels: levels.len() as u32,
+            pFeatureLevelsRequested: levels.as_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: each initialized output matches the selected feature and exact structure size.
+        unsafe {
+            com(
+                device.CheckFeatureSupport(
+                    D3D12_FEATURE_FEATURE_LEVELS,
+                    (&mut level as *mut D3D12_FEATURE_DATA_FEATURE_LEVELS).cast(),
+                    core::mem::size_of_val(&level) as u32,
+                ),
+                "feature level capabilities",
+            )?;
+        }
+        let caps = serde_json::json!({"schema":1,"highest_shader_model":shader.HighestShaderModel.0,
+            "max_feature_level":level.MaxSupportedFeatureLevel.0,"vendor_id":vendor_id,"device_id":device_id});
+        let output = open("Z:\\frames\\d3d12-capabilities.json", true)?;
+        write_handle(
+            output.0,
+            &serde_json::to_vec_pretty(&caps).map_err(|e| e.to_string())?,
+        )?;
+        log(&format!("D3D12 capabilities: {caps}"));
         // SAFETY: queue/allocator/list types agree (DIRECT); fence and heap are owned by this device.
         let (queue, allocator, commands, descriptors, rtv, fence) = unsafe {
             let queue: ID3D12CommandQueue = com(
@@ -940,6 +996,10 @@ fn measure(gpu: &mut Gpu, config: &Config, mode: &str, frequency: u64) -> Result
 }
 
 fn run() -> Result<()> {
+    if cfg!(feature = "d3d11-probe") {
+        #[cfg(feature = "d3d11-probe")]
+        return dx11::run();
+    }
     if cpu_audit::observe_if_requested()? {
         return Ok(());
     }

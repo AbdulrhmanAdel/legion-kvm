@@ -138,37 +138,10 @@ pub fn inspect() -> Result<HostReport> {
         ),
     });
     let render_devices = render_devices()?;
-    let has_nvidia = render_devices
-        .iter()
-        .any(|gpu| gpu.driver.as_deref() == Some("nvidia"));
-    if has_nvidia {
-        let backend = executable(OsStr::new("vhost-user-nvgpu"));
-        checks.push(Check {
-            component: "nvidia_backend",
-            status: if backend.is_some() { "unverified" } else { "missing" },
-            detail: backend.map_or_else(
-                || "vhost-user-nvgpu is not installed; the generic QEMU GPU device does not substitute for it".to_owned(),
-                |path| format!("{}; backend negotiation and driver ABI still need verification", path.display()),
-            ),
-        });
-        checks.push(Check {
-            component: "nvidia_driver",
-            status: "unverified",
-            detail: fs::read_to_string("/proc/driver/nvidia/version")
-                .unwrap_or_else(|error| error.to_string())
-                .trim()
-                .to_owned(),
-        });
-    }
     checks.push(Check {
-        component: "shared_gpu_and_display",
+        component: "venus_graphics",
         status: "unverified",
-        detail: "GPU acceleration requires the selected transport, matching guest modules and graphics libraries".to_owned(),
-    });
-    checks.push(Check {
-        component: "portable_gpu_backends",
-        status: "unimplemented",
-        detail: "NVIDIA and AMD use separate runtime backends; Intel graphics is unsupported"
+        detail: "Use the packaged runtime's doctor --graphics to check host Vulkan through Venus"
             .to_owned(),
     });
     checks.push(Check {
@@ -239,10 +212,7 @@ pub(crate) fn render_devices() -> Result<Vec<RenderDevice>> {
 
 fn backend_for_driver(driver: Option<&str>) -> (&'static str, &'static str) {
     match driver {
-        Some("nvidia") => ("nvidia_abi", "requires_runtime"),
-        Some("amdgpu") => ("amdgpu_native_context", "not_integrated"),
-        Some("i915") => ("intel_i915_native_context", "not_integrated"),
-        Some("xe") => ("intel_xe_native_context", "not_integrated"),
+        Some("nvidia" | "amdgpu" | "i915" | "xe") => ("venus", "requires_guest_check"),
         _ => ("unsupported", "unsupported"),
     }
 }

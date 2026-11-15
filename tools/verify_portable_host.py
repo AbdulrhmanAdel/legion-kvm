@@ -9,11 +9,9 @@ import subprocess
 def verify(runtime, output, emulator='qemu-x86_64'):
     runtime=runtime.resolve()
     manifest=json.loads((runtime/'runtime.json').read_text())
-    amd=manifest['amdgpu']
     tools=[('qemu',manifest['qemu'],manifest,'--version'),
-           ('qemu-amdgpu',amd['qemu'],amd,'--version'),
            ('virtiofsd',manifest['virtiofsd'],manifest,'--version'),
-           ('nvidia-backend',manifest['backend'],manifest,'--help')]
+           ('venus-renderer',manifest['renderer'],manifest,'--socket-fd=-1')]
     checks={}
     for cpu in ('Haswell,-hle,-rtm','Westmere'):
         for name,program,assets,argument in tools:
@@ -24,13 +22,16 @@ def verify(runtime, output, emulator='qemu-x86_64'):
                     raise ValueError('host runtime asset escapes its directory')
             command=[emulator,'-cpu',cpu,str(paths[0]),'--library-path',str(paths[1]),str(binary),argument]
             reply=subprocess.run(command,capture_output=True,text=True,timeout=30)
-            checks[cpu+':'+name]=dict(passed=reply.returncode==0,returncode=reply.returncode,
+            # Upstream render_server has no help/version command. Reaching its
+            # invalid-client validation proves startup; guest Vulkan is tested separately.
+            passed = (reply.returncode == 255 and 'no valid client fd specified' in reply.stderr) if name == 'venus-renderer' else reply.returncode == 0
+            checks[cpu+':'+name]=dict(passed=passed,returncode=reply.returncode,
                                     stderr=reply.stderr,stdout=reply.stdout[:300])
     report=dict(schema=1,passed=all(c['passed'] for c in checks.values()),checks=checks)
     output.write_text(json.dumps(report,indent=2)+'\n')
     if not report['passed']:
         raise RuntimeError('portable host startup checks failed: '+str(output))
-    print('All eight non-AVX-512 host-tool checks passed')
+    print('All six non-AVX-512 host-tool checks passed')
 
 
 def main():

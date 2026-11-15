@@ -12,16 +12,6 @@ pub enum HugePages {
     System,
 }
 
-impl HugePages {
-    pub fn parse(value: &std::ffi::OsStr) -> Result<Self> {
-        match value.to_str() {
-            Some("off") => Ok(Self::Off),
-            Some("system") => Ok(Self::System),
-            _ => bail!("QEMU hugepages must be off or system"),
-        }
-    }
-}
-
 pub fn command(program: &Path, policy: HugePages) -> Result<Command> {
     if policy == HugePages::System {
         return Ok(Command::new(program));
@@ -50,4 +40,11 @@ pub fn exec(args: &[OsString]) -> Result<()> {
     eprintln!("LEGION_QEMU_POLICY hugepages=off scope=qemu-process");
     let error = Command::new(program).args(arguments).exec();
     Err(error).with_context(|| format!("exec QEMU command {program:?}"))
+}
+
+pub(crate) fn qemu_path(path: &Path) -> Result<String> {
+    Ok(path
+        .to_str()
+        .context("QEMU socket path must be UTF-8")?
+        .replace(',', ",,"))
 }

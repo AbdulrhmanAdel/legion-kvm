@@ -1,17 +1,21 @@
 //! Select graphics by the loaded DRM driver, with an optional explicit node.
 use crate::doctor::{self, RenderDevice};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Graphics {
-    Nvidia,
-    Amd(PathBuf),
+pub(crate) struct Graphics {
+    pub node: PathBuf,
+    pub driver: String,
 }
 
 pub(crate) fn select(devices: &[RenderDevice], requested: Option<&Path>) -> Result<Graphics> {
     let eligible = |device: &&RenderDevice| {
-        device.read_write_access && matches!(device.driver.as_deref(), Some("nvidia" | "amdgpu"))
+        device.read_write_access
+            && matches!(
+                device.driver.as_deref(),
+                Some("nvidia" | "amdgpu" | "i915" | "xe")
+            )
     };
     let device = if let Some(node) = requested {
         devices
@@ -26,12 +30,11 @@ pub(crate) fn select(devices: &[RenderDevice], requested: Option<&Path>) -> Resu
             .filter(eligible)
             .find(|device| device.driver.as_deref() == Some("nvidia"))
             .or_else(|| devices.iter().find(eligible))
-            .context("no accessible NVIDIA or AMD graphics device")?
+            .context("no accessible hardware Vulkan render node")?
     };
-    Ok(if device.driver.as_deref() == Some("amdgpu") {
-        Graphics::Amd(device.node.clone())
-    } else {
-        Graphics::Nvidia
+    Ok(Graphics {
+        node: device.node.clone(),
+        driver: device.driver.clone().context("missing DRM driver")?,
     })
 }
 
@@ -42,15 +45,17 @@ pub(crate) fn detect() -> Result<Graphics> {
     select(&doctor::render_devices()?, node.as_deref())
 }
 
-pub(crate) fn require_amd(selection: &Graphics) -> Result<&Path> {
-    ensure!(
-        matches!(selection, Graphics::Amd(_)),
-        "this rendering benchmark requires an AMD render node"
-    );
-    match selection {
-        Graphics::Amd(node) => Ok(node),
-        Graphics::Nvidia => unreachable!("checked above"),
-    }
+pub(crate) fn pci_id(node: &Path) -> Result<(u16, u16)> {
+    let device = Path::new("/sys/class/drm")
+        .join(node.file_name().context("render node name missing")?)
+        .join("device");
+    let read = |name: &str| -> Result<u16> {
+        let value = std::fs::read_to_string(device.join(name))
+            .with_context(|| format!("read selected GPU PCI {name}"))?;
+        u16::from_str_radix(value.trim().trim_start_matches("0x"), 16)
+            .with_context(|| format!("invalid selected GPU PCI {name}"))
+    };
+    Ok((read("vendor")?, read("device")?))
 }
 
 #[cfg(test)]

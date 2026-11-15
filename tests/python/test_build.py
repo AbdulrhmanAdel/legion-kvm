@@ -9,9 +9,61 @@ from unittest.mock import patch
 import build_runtime
 import verify_portable_host
 import host_abi
+import build as launcher_build
+import build_venus_probe
 
 
 class BuildTests(unittest.TestCase):
+    def test_renderer_patch_is_applied_once_and_does_not_skip_an_unpatched_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'sample.c'
+            source.write_text('before\n')
+            patch_file = root/'change.patch'
+            patch_file.write_text('--- a/sample.c\n+++ b/sample.c\n@@ -1 +1 @@\n-before\n+after\n')
+            build_venus_probe.apply_renderer_patch(root, patch_file)
+            self.assertEqual(source.read_text(), 'after\n')
+            build_venus_probe.apply_renderer_patch(root, patch_file)
+            self.assertEqual(source.read_text(), 'after\n')
+
+    def test_default_build_needs_no_proton_installation_or_repair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch('sys.argv', ['build.py', '--engine', 'docker', '--output', directory]), \
+                    patch('build.source_identity', return_value='source'), \
+                    patch('build.subprocess.check_output', return_value='image\n'), \
+                    patch('build.subprocess.run') as run:
+                launcher_build.main()
+            command = run.call_args.args[0]
+            self.assertIn('LEGION_WINE_REPAIR=0', command)
+            self.assertFalse(any(':/proton:' in arg for arg in command))
+
+    def test_optional_dependency_input_is_not_subject_to_the_repair_hash_pin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            proton = root/'other-proton'
+            proton.mkdir()
+            with patch('sys.argv', ['build.py', '--engine', 'docker', '--output', str(root/'build'), '--proton', str(proton)]), \
+                    patch('build.source_identity', return_value='source'), \
+                    patch('build.subprocess.check_output', return_value='image\n'), \
+                    patch('build.subprocess.run') as run:
+                launcher_build.main()
+            self.assertIn(str(proton)+':/proton:ro', run.call_args.args[0])
+
+    def test_selinux_build_preserves_existing_volume_labels(self):
+        with patch('build.subprocess.check_output', return_value='{"selinuxEnabled":true}'):
+            self.assertEqual(launcher_build.container_security('podman'), ['--security-opt', 'label=disable'])
+        with patch('build.subprocess.check_output', return_value='{"selinuxEnabled":false}'):
+            self.assertEqual(launcher_build.container_security('podman'), [])
+        with patch('build.subprocess.check_output') as info:
+            self.assertEqual(launcher_build.container_security('docker'), [])
+            info.assert_not_called()
+
+    def test_build_identity_changes_when_source_is_modified(self):
+        with patch('build.subprocess.check_output', side_effect=['commit\n', b'']):
+            self.assertEqual(launcher_build.source_identity(Path('.')), 'commit')
+        with patch('build.subprocess.check_output', side_effect=['commit\n', b'diff']):
+            self.assertTrue(launcher_build.source_identity(Path('.')).startswith('commit-dirty-'))
+
     def test_host_abi_rejects_a_corrupt_cached_package_before_extraction(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -51,7 +103,7 @@ class BuildTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             assets = dict(qemu='../outside', host_loader='loader', host_libraries='lib')
-            manifest = dict(assets, backend='backend', virtiofsd='virtiofsd', amdgpu=assets)
+            manifest = dict(assets, renderer='renderer', virtiofsd='virtiofsd')
             (root/'runtime.json').write_text(json.dumps(manifest))
             with patch('verify_portable_host.subprocess.run') as run:
                 with self.assertRaisesRegex(ValueError, 'escapes'):

@@ -69,6 +69,8 @@ pub struct State {
     pub track_buffers: bool,
     pub gpu_only: bool,
     pub diagnose_surfaces: bool,
+    pub(crate) cursor_image: smithay::input::pointer::CursorImageStatus,
+    pub(crate) cursor_generation: u64,
     pub last_source_surface: Option<WlSurface>,
     presentation_root: Option<WlSurface>,
     pub inactive_surface_buffers: u64,
@@ -197,9 +199,11 @@ impl State {
         seat.add_keyboard(Default::default(), 200, 25)
             .context("create keyboard keymap")?;
         seat.add_pointer();
-        let feedback = DmabufFeedbackBuilder::new(dev, formats).build()?;
         let mut dmabuf = DmabufState::new();
-        dmabuf.create_global_with_default_feedback::<Self>(dh, &feedback);
+        if !formats.is_empty() {
+            let feedback = DmabufFeedbackBuilder::new(dev, formats).build()?;
+            dmabuf.create_global_with_default_feedback::<Self>(dh, &feedback);
+        }
         let output_manager = OutputManagerState::new_with_xdg_output::<Self>(dh);
         let output = Output::new(
             "legion-0".into(),
@@ -243,6 +247,8 @@ impl State {
             track_buffers: false,
             gpu_only: false,
             diagnose_surfaces: false,
+            cursor_image: smithay::input::pointer::CursorImageStatus::default_named(),
+            cursor_generation: 0,
             last_source_surface: None,
             presentation_root: None,
             inactive_surface_buffers: 0,
@@ -403,6 +409,47 @@ impl State {
     ) {
         self.source_commits += 1;
         if self.gpu_only && smithay::wayland::dmabuf::get_dmabuf(&buffer).is_err() {
+            if self.diagnose_surfaces && self.shm_skipped < 32 {
+                // Capture bounded software UI only in explicit diagnostic runs.
+                // Wine's error dialogs may be SHM even when game frames use DMA-BUF.
+                let _ = smithay::wayland::shm::with_buffer_contents(
+                    &buffer,
+                    |pointer, len, data| {
+                        use std::io::Write;
+                        let (Ok(width), Ok(height), Ok(stride), Ok(offset)) = (
+                            usize::try_from(data.width),
+                            usize::try_from(data.height),
+                            usize::try_from(data.stride),
+                            usize::try_from(data.offset),
+                        ) else {
+                            return;
+                        };
+                        if width == 0 || height == 0 || width > 4096 || height > 2160
+                        || stride < width * 4 || offset.checked_add(stride * height).is_none_or(|end| end > len)
+                        || !matches!(data.format, smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb8888
+                            | smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb8888)
+                    { return; }
+                        // SAFETY: Smithay keeps this SHM mapping live for the closure;
+                        // the checked extent bounds every row read below.
+                        let bytes = unsafe { std::slice::from_raw_parts(pointer, len) };
+                        let path = format!("/frames/diagnostic-shm-{}.ppm", self.shm_skipped);
+                        if let Ok(mut file) = std::fs::File::create(path) {
+                            let _ = write!(file, "P6\n{width} {height}\n255\n");
+                            for y in 0..height {
+                                let row =
+                                    &bytes[offset + y * stride..offset + y * stride + width * 4];
+                                let rgb: Vec<u8> = row
+                                    .as_chunks::<4>()
+                                    .0
+                                    .iter()
+                                    .flat_map(|p| [p[2], p[1], p[0]])
+                                    .collect();
+                                let _ = file.write_all(&rgb);
+                            }
+                        }
+                    },
+                );
+            }
             self.shm_skipped += 1;
             self.discard_buffer(buffer, sync);
             return;
@@ -520,12 +567,22 @@ impl CompositorHandler for State {
             .compositor
     }
     fn commit(&mut self, surface: &WlSurface) {
+        if matches!(&self.cursor_image, smithay::input::pointer::CursorImageStatus::Surface(cursor) if cursor == surface)
+        {
+            self.cursor_generation = self.cursor_generation.wrapping_add(1);
+            return;
+        }
         if self.gpu_only {
             let diagnose = self.diagnose_surfaces;
             let explicit_sync = self.syncobj.is_some();
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {
                 root = parent;
+            }
+            // An unmapped surface may become a cursor after its first commit.
+            // Retain that buffer until the client assigns a role.
+            if smithay::wayland::compositor::get_role(&root).is_none() {
+                return;
             }
             let selected = self.accepts_root(&root);
             let mut buffers = Vec::new();
@@ -671,6 +728,8 @@ impl SeatHandler for State {
             image,
             smithay::input::pointer::CursorImageStatus::Hidden
         ));
+        self.cursor_image = image;
+        self.cursor_generation = self.cursor_generation.wrapping_add(1);
     }
 }
 impl OutputHandler for State {}

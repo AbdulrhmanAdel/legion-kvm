@@ -1,0 +1,47 @@
+GE-Proton11-11 server protocol projection for the isolated graphics rebuild.
+Derived from the release's ntdll-prefer-native-version-resource-heuristics.patch
+and proton-ds5-haptic/0191-route-sony-effects-by-active-hid-controller.patch.
+Only protocol declarations are needed: the installed wineserver and ntdll stay
+unchanged. Regenerate include/wine/server_protocol.h with tools/make_requests.
+
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1940,8 +1940,10 @@
+     unsigned int flags;         /* SEC_* flags */
+     obj_handle_t shared_file;   /* shared mapping file handle */
+     data_size_t  name_len;      /* length of file name  */
++    data_size_t  ver_len;       /* length of version resource  */
+     data_size_t  total;         /* total required buffer size in bytes */
+     VARARG(image,pe_image_info);/* image info for SEC_IMAGE mappings */
++    VARARG(version,version_res,ver_len);/* version resource for SEC_IMAGE mappings */
+     VARARG(name,unicode_str,name_len);  /* filename for SEC_IMAGE mappings */
+     VARARG(exp_name,string);    /* exported name for SEC_IMAGE mappings */
+ @END
+@@ -3920,6 +3922,27 @@
+ @END
+ 
+ 
++/* Set or clear the Sony controller which most recently generated input */
++@REQ(set_sony_active_controller)
++    unsigned int container0;      /* physical container GUID bytes 0-3 */
++    unsigned int container1;      /* physical container GUID bytes 4-7 */
++    unsigned int container2;      /* physical container GUID bytes 8-11 */
++    unsigned int container3;      /* physical container GUID bytes 12-15 */
++    int          valid;           /* nonzero to set, zero to clear matching ID */
++@END
++
++
++/* Get the Sony controller which most recently generated input */
++@REQ(get_sony_active_controller)
++@REPLY
++    unsigned int container0;      /* physical container GUID bytes 0-3 */
++    unsigned int container1;      /* physical container GUID bytes 4-7 */
++    unsigned int container2;      /* physical container GUID bytes 8-11 */
++    unsigned int container3;      /* physical container GUID bytes 12-15 */
++    int          valid;           /* whether the returned ID is valid */
++@END
++
++
+ /* Create a device */
+ @REQ(create_device)
+     obj_handle_t rootdir;         /* root directory */

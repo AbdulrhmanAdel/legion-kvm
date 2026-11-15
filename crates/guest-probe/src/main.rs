@@ -136,34 +136,20 @@ fn main() {
         serde_json::json!({"schema":2,"passed":passed,"xcr0":xcr0,"avx512_sigill":sigill,"leaf0":leaf0,"leaf1":leaf1,"leaf7":leaf7,"leafd0":leafd,"topology":topology,"topology_error":topology_error})
     );
     let _ = std::io::stdout().flush();
-    if std::path::Path::new("/modules/load-order").is_file() {
-        if std::fs::read_to_string("/proc/cmdline").is_ok_and(|cmdline| {
+    if std::path::Path::new("/modules/load-order").is_file()
+        && std::fs::read_to_string("/proc/cmdline").is_ok_and(|cmdline| {
             cmdline
                 .split_whitespace()
                 .any(|arg| arg == "legion.drm_probe=1")
-        }) {
-            let report = gpu::drm_report();
-            println!("LEGION_DRM_PROBE {report}");
-            let _ = std::io::stdout().flush();
-            if report["passed"] == true
-                && std::fs::read_to_string("/proc/cmdline")
-                    .is_ok_and(|text| text.split_whitespace().any(|arg| arg == "legion.vulkan=1"))
-            {
-                println!("LEGION_VULKAN_PROBE {}", gpu::vulkan_report());
-                let _ = std::io::stdout().flush();
-            }
-            loop {
-                std::thread::park();
-            }
-        }
-        let report = gpu::report();
-        println!("LEGION_GPU_PROBE {report}");
+        })
+    {
+        let report = gpu::drm_report();
+        println!("LEGION_DRM_PROBE {report}");
         let _ = std::io::stdout().flush();
-        if std::fs::read_to_string("/proc/cmdline").is_ok_and(|cmdline| {
-            cmdline
-                .split_whitespace()
-                .any(|arg| arg == "legion.vulkan=1")
-        }) {
+        if report["passed"] == true
+            && std::fs::read_to_string("/proc/cmdline")
+                .is_ok_and(|text| text.split_whitespace().any(|arg| arg == "legion.vulkan=1"))
+        {
             println!("LEGION_VULKAN_PROBE {}", gpu::vulkan_report());
             let _ = std::io::stdout().flush();
         }

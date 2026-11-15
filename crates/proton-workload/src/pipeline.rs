@@ -18,12 +18,12 @@ enum RetirementWakeup {
     Cpuid,
 }
 
-fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
+pub(super) fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
     // SAFETY: ID3DBlob owns the immutable buffer for the returned borrow's lifetime.
     unsafe { core::slice::from_raw_parts(blob.GetBufferPointer().cast(), blob.GetBufferSize()) }
 }
 
-fn compile(source: &[u8], entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
+pub(super) fn compile(source: &[u8], entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
     let mut code = None;
     let mut errors = None;
     // SAFETY: source has its exact byte count, static strings are terminated, outputs are initialized; no include callbacks or filesystem access.

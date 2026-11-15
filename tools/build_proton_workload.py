@@ -12,6 +12,7 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--target-dir", type=Path,
                         help="isolated Cargo output directory; preserves earlier PE builds")
+    parser.add_argument("--api", choices=["d3d11", "d3d12"], default="d3d12")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -25,8 +26,9 @@ def main():
     subprocess.run(["llvm-dlltool", "-m", "i386:x86-64", "-d", str(definition),
                     "-l", str(output / "msvcrt.lib")], check=True)
     target_dir = ["--target-dir", str(args.target_dir.resolve())] if args.target_dir else []
+    features = ["--features", "d3d11-probe"] if args.api == "d3d11" else []
     subprocess.run(["cargo", "rustc", "-p", "legion-proton-workload", "--bin", "legion-proton-workload",
-                    "--release", "--offline", "--target", "x86_64-pc-windows-msvc", "-j2", *target_dir, "--",
+                    "--release", "--offline", "--target", "x86_64-pc-windows-msvc", "-j2", *target_dir, *features, "--",
                     "-C", "linker=lld-link", "-L", f"native={output}",
                     "-C", "link-arg=/entry:mainCRTStartup", "-C", "link-arg=/subsystem:console"], check=True)
 

@@ -1,19 +1,17 @@
 # Legion KVM
 
-Legion runs Windows applications through Proton inside a Linux KVM guest,
-with a local desktop window and shared graphics access. The launcher detects
-CPU topology and selects the graphics backend independently of CPU vendor.
-
-The runtime includes NVIDIA and AMD graphics paths, guest initialization,
-CPU compatibility profiles, display transport, input, audio and directory
-sharing. AVX-512 is not a host requirement. The guest uses reduced XSTATE.
-Hardware and graphics-driver support depend on the selected backend.
+Legion runs Windows applications through Proton inside a Linux KVM guest.
+Graphics use Mesa Venus over virtio-GPU, with a local desktop window, input,
+audio and shared directories. The guest kernel, Mesa, virglrenderer and QEMU
+are bundled. GPU vendor drivers stay on the host; Legion no longer forwards
+NVIDIA ioctls or maintains NVIDIA driver ABI tables.
 
 ## Running
 
-A packaged executable contains the guest kernel and runtime assets. Run it as
-your desktop user with access to `/dev/kvm` and the graphics device. The desktop
-presentation path requires Wayland.
+Run the packaged executable as your desktop user with access to `/dev/kvm`
+and your GPU render node. A Wayland desktop and a host Vulkan driver with the
+external-memory and synchronization capabilities required by Venus are needed.
+AVX-512 is not required; the guest uses the reduced XSTATE CPU profile.
 
 Steam launch options:
 
@@ -21,95 +19,106 @@ Steam launch options:
 /path/to/legion %command%
 ```
 
-Other launchers can place Legion before their Proton command. An explicit
-launch accepts an installed Proton and an existing Wine prefix:
+An explicit launch can select an installed Proton and Wine prefix:
 
 ```sh
 legion run --proton /path/to/Proton --prefix /path/to/prefix -- /path/to/application.exe
 ```
 
-The selected prefix and home directory remain shared with the application.
-Normal application and Proton writes reach those locations. Compatibility
-repairs are applied inside the guest, and installed Proton files remain
-unchanged. Selected Wine components must match the runtime compatibility
-recipe; arbitrary Proton builds are not interchangeable with a given recipe.
-
-Useful commands:
+The selected prefix, application directory and home remain shared and writable.
+Installed Proton files remain unchanged. Legion does not require a particular
+Proton version, but that Proton must support Wine Wayland and the Vulkan features
+the game needs. In particular, Vulkan layered-driver reporting through
+`VK_KHR_maintenance7` matters for some VKD3D feature checks. The private matched
+Wine graphics backport used in UE5 testing is a research tool, not a universal
+replacement for arbitrary Proton builds. See [research notes](docs/venus-research.md).
 
 ```sh
 legion doctor
+legion doctor --graphics
 legion cpu-check
-legion --version
 ```
 
-`LEGION_RENDER_NODE` selects a DRM render node on systems with multiple GPUs.
-`LEGION_MEMORY_MIB` selects guest memory; the default is 12288 MiB.
-`LEGION_FULLSCREEN=1` opens the AMD display fullscreen at its configured resolution.
-`LEGION_DISPLAY_BACKEND=auto|wayland|xwayland` selects Wine's display backend on NVIDIA; the default remains XWayland. Direct Wayland requires support in the selected Proton build. AMD uses Wayland.
-`LEGION_STARTUP_UI=auto|window|log|off` controls startup feedback. Runtime files
-are cached under `XDG_CACHE_HOME/legion`; logs use `XDG_STATE_HOME/legion`.
+`doctor` checks host prerequisites. `doctor --graphics` boots a disposable VM,
+opens the host display window and verifies guest hardware Vulkan enumeration
+without touching a game or prefix. Enumeration alone does not prove rendering;
+application and synthetic tests provide that evidence separately.
+
+Configuration:
+
+- `LEGION_RENDER_NODE` selects a DRM render node, such as `/dev/dri/renderD128`.
+- `LEGION_MEMORY_MIB` sets guest RAM; the default is 12288 MiB.
+- `LEGION_FULLSCREEN=1` opens the host display fullscreen.
+- `LEGION_WINDOW_SYSTEM=auto|wayland|x11` selects the host window system. Auto
+  retries through XWayland only if initial Wayland window creation fails.
+- Games use the guest Wayland compositor. `LEGION_DISPLAY_BACKEND=wayland`
+  remains accepted; the retired NVIDIA XWayland forwarding path is unavailable.
+- `LEGION_STARTUP_UI=auto|window|log|off` controls startup feedback.
+- `LEGION_STARTUP_TIMEOUT_SECONDS` allows 30–900 seconds to the first frame
+  (default 180). Interactive sessions have no time limit after that frame.
+
+The desktop window leaves system shortcuts, including Super/Windows bindings,
+with the host compositor. Guest cursor images use the virtual GPU's hardware
+cursor; moving the pointer does not copy the game's framebuffer through the CPU.
+
+Logs are saved under `XDG_STATE_HOME/legion`, normally `~/.local/state/legion`.
+Keep the printed session directory when reporting failures. It contains the
+build identifier, launch configuration, VM report, QEMU/console logs and guest
+startup stages. Include `legion --version`, `doctor`, and `doctor --graphics`.
+Runtime extraction is cached under `XDG_CACHE_HOME/legion`.
+
+The Venus cutover is tested on an RTX 4070 Ti SUPER with NVIDIA 620.70.06;
+the earlier performance studies used 615.78.08. The Ryzen 9800X3D integrated
+Radeon 610M also passed D3D11 pixel checks and D3D12 pixel/presentation checks
+through Venus using a private RADV 25.0.7 host driver. Other GPU/driver
+combinations and 32-bit games still require qualification.
+
+An AMD kernel driver alone is insufficient: the host also needs an AMD Vulkan
+driver (for example, `vulkan-radeon` on Arch-based systems). Normal sessions
+verify that the guest Vulkan vendor/device IDs match the selected render node
+before starting the application. Missing drivers or a conflicting
+`VK_DRIVER_FILES` setting must fail rather than silently use another GPU.
+NVAPI/NGX integration is disabled on this path pending separate validation.
 
 ## Building
 
-Install Python 3.11 or later and rootless Podman, or use an accessible Docker
-engine. The complete build uses an isolated Debian toolchain; host Rust and
-development libraries are not required. Allow at least 25 GiB of free disk
-space and an internet connection for the first build.
-
-Clone the repository and build the executable:
+Install Python 3.11 or later and rootless Podman or an accessible Docker engine.
+The build uses an isolated Debian toolchain; host Rust and development libraries
+are not required. Allow at least 25 GiB and internet access for a first build.
 
 ```sh
 git clone https://github.com/brcly/legion-kvm.git
 cd legion-kvm
-python3 tools/build.py --proton /path/to/GE-Proton11-11 --jobs 4
+python3 tools/build.py --jobs 4
 ```
 
-The result is **`build/dist/legion`**. This single executable includes the guest
-kernel, matching modules, graphics backends, QEMU and guest userspace. Copy it
-to another supported system and mark it executable. Users supply their own
-applications and installed Proton; neither is included in the executable.
+The result is **`build/dist/legion`**, a single executable containing the runtime.
+Users supply their applications, Proton and host Vulkan driver. No module is
+installed into the host kernel. No installed Proton is needed to build Legion;
+`--proton /path/to/Proton` optionally adds dependency discovery without pinning
+normal launches to that version.
 
-The current compatibility input is GE-Proton11-11. The build verifies the
-selected installation against `config/compatibility.json` before compiling.
-It reads that installation without modifying it. A different Proton version
-needs a compatible repair recipe; bypassing the hash check is unsupported.
+Sources/checksums live in `config/sources.json`; the private host ABI package
+baseline is recorded in `config/host-packages.json`. The build compiles Venus,
+virglrenderer with Venus enabled, QEMU, the guest kernel and production Rust
+binaries, then checks host-tool startup on CPU profiles without AVX-512.
+Downloads and intermediate files stay in ignored `build/`. Repeating the build
+resumes completed stages; `--output` selects another build directory.
 
-Public dependency sources and checksums are recorded in `config/sources.json`.
-Portable host ABI packages are pinned in `config/host-packages.json`.
-The build downloads and compiles those sources, builds the Rust workspaces,
-assembles the runtime and checks host-tool startup without AVX-512. Downloads
-and intermediate outputs stay under the ignored `build/` directory. Repeating
-the command resumes completed stages. Use `--output` for another build directory
-or `--engine docker` to select Docker explicitly.
-
-No module is installed into the host kernel. Runtime use requires x86-64 Linux,
-enabled hardware virtualization, access to `/dev/kvm`, a Wayland desktop, and a
-supported NVIDIA or AMD graphics device. GPU drivers remain on the host. Intel
-CPUs use the same KVM launch path; Intel graphics are not supported.
-
-To check the resulting executable before launching an application:
-
-```sh
-build/dist/legion doctor
-build/dist/legion cpu-check
-```
-
-`cargo build --release` builds only the launcher for development. Use the
-Python build command above for a complete, distributable executable.
+`--wine-repair --proton /matching/Proton` can include the existing optional
+ntdll repair, checked against `config/compatibility.json`. It remains disabled
+unless `LEGION_WINE_REPAIR=1` is set. Normal Venus launches use stock Proton and
+have no ntdll hash requirement.
 
 ## Development
 
-Local Rust development requires Rust 1.99 and development libraries for
-Wayland, XKB, EGL, GBM, DRM, SDL2 and Vulkan. The NVIDIA backend has a separate
-Cargo workspace under `backends/nvidia`.
+The production path is launcher → QEMU/virtio-GPU → virglrenderer/Vulkan, with
+Mesa Venus in the guest. CPU compatibility, directory sharing, Proton startup,
+KMS presentation, input and audio remain common services. Research workloads
+and benchmark tools are not required in a distributed runtime.
 
-Unit tests live in each package’s `tests/unit/` directory (backend binary tests
-use `tests/bin/`). Test-only fixtures and helper executables live under
-`tests/support/`, with recorded fixture data in `tests/fixtures/`. Rust source
-modules load their unit tests with `#[cfg(test)]` and explicit paths, preserving
-private access without exposing internal APIs.
-Launcher integration tests stay in `tests/cli.rs`; Python tests live in
-`tests/python/`.
+Local development needs Rust 1.99 and Wayland, XKB, EGL, GBM, DRM, SDL2 and
+Vulkan development libraries. `cargo build --release` builds only the launcher.
 
 ```sh
 PYTHONPATH=tools python3 -m unittest discover -s tests/python -p 'test_*.py'
@@ -117,14 +126,13 @@ cargo fmt --all --check
 cargo check --workspace --all-targets --all-features
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo fmt --all --manifest-path backends/nvidia/Cargo.toml --check
-cargo test --workspace --manifest-path backends/nvidia/Cargo.toml --features device/vhost-user
-cargo clippy --workspace --all-targets --manifest-path backends/nvidia/Cargo.toml --features device/vhost-user -- -D warnings
 ```
+
+[Venus research tools](docs/venus-research.md) cover correctness fixtures,
+performance comparisons and the private Wine graphics experiment.
 
 ## License
 
-The main Rust workspace is licensed under AGPL-3.0-only. NVIDIA backend
-components retain their Apache-2.0, BSD-3-Clause and GPL licenses. Kernel and
-QEMU components retain their respective upstream licenses. See `LICENSE` and
-`NOTICE`.
+The Rust workspace is AGPL-3.0-only. Linux, QEMU, Mesa, virglrenderer and other
+bundled components retain their upstream licenses. Source notices and dependency
+licenses accompany the packaged runtime. See `LICENSE` and `NOTICE`.

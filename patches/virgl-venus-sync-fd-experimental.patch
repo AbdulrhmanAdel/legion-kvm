@@ -1,0 +1,40 @@
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -4,6 +4,8 @@
+  */
+ 
+ #include "vkr_queue.h"
++#include <poll.h>
++#include <errno.h>
+ 
+ #include "venus-protocol/vn_protocol_renderer_queue.h"
+ 
+@@ -177,8 +179,26 @@
+       if (sync->device_lost) {
+          result = VK_ERROR_DEVICE_LOST;
+       } else {
+-         result = vk->WaitForFences(dev->base.handle.device, 1, &sync->fence, true,
+-                                    ns_per_sec * 3);
++         if (getenv("LEGION_VENUS_SYNC_FD") && dev->physical_device->KHR_external_fence_fd) {
++            const VkFenceGetFdInfoKHR info = {
++               .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
++               .fence = sync->fence,
++               .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
++            };
++            int fd = -1;
++            result = vk->GetFenceFdKHR(dev->base.handle.device, &info, &fd);
++            if (result == VK_SUCCESS && fd >= 0) {
++               struct pollfd event = { .fd = fd, .events = POLLIN };
++               int ready;
++               do { ready = poll(&event, 1, -1); } while (ready < 0 && errno == EINTR);
++               result = ready > 0 && (event.revents & POLLIN) && !(event.revents & (POLLERR | POLLNVAL))
++                  ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
++               close(fd);
++            }
++         } else {
++            result = vk->WaitForFences(dev->base.handle.device, 1, &sync->fence, true,
++                                       ns_per_sec * 3);
++         }
+       }
+ 
+       mtx_lock(&queue->sync_thread.mutex);

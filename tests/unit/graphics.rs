@@ -15,12 +15,21 @@ fn mixed_default_is_preserved_and_explicit_selection_never_falls_back() -> Resul
         device("amdgpu", "/dev/dri/renderD129"),
         device("nvidia", "/dev/dri/renderD128"),
     ];
-    assert_eq!(select(&devices, None)?, Graphics::Nvidia);
+    assert_eq!(
+        select(&devices, None)?,
+        Graphics {
+            node: "/dev/dri/renderD128".into(),
+            driver: "nvidia".into()
+        }
+    );
     assert_eq!(
         select(&devices, Some(Path::new("/dev/dri/renderD129")))?,
-        Graphics::Amd("/dev/dri/renderD129".into())
+        Graphics {
+            node: "/dev/dri/renderD129".into(),
+            driver: "amdgpu".into()
+        }
     );
     assert!(select(&devices, Some(Path::new("/missing"))).is_err());
-    assert!(matches!(select(&devices[..1], None)?, Graphics::Amd(_)));
+    assert_eq!(select(&devices[..1], None)?.driver, "amdgpu");
     Ok(())
 }

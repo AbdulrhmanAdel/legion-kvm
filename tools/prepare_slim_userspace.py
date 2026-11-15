@@ -16,7 +16,7 @@ cat cp mv mkdir chmod ln readlink rm rmdir sed grep egrep fgrep cut tr head tail
 uname realpath which locale localedef id ls find sort dirname basename stat wc
 touch expr printf true false getent getconf ldd ldconfig tar gzip xz xrandr
 xdg-user-dir xdg-user-dirs-update sleep test timeout date tee uniq file'''.split()
-LIBRARIES = '''libgbm.so.1 libdrm.so.2 libnvidia-egl-gbm.so.1 libvulkan.so.1 libEGL.so.1 libGL.so.1 libGLX.so.0 libGLdispatch.so.0
+LIBRARIES = '''libgbm.so.1 libdrm.so.2 libvulkan.so.1 libEGL.so.1 libGL.so.1 libGLX.so.0 libGLdispatch.so.0
 libGLESv2.so.2 libwayland-client.so.0 libwayland-cursor.so.0 libwayland-egl.so.1
 libxkbcommon.so.0 libasound.so.2 libX11.so.6 libXext.so.6 libXcursor.so.1
 libXrandr.so.2 libXfixes.so.3 libXi.so.6 libXrender.so.1 libfreetype.so.6
@@ -28,9 +28,25 @@ X11_LIBRARIES = '''libX11-xcb.so.1 libxcb.so.1 libxcb-dri3.so.0 libxcb-present.s
 libxcb-sync.so.1 libxcb-xfixes.so.0 libxcb-glx.so.0 libxcb-randr.so.0
 libxshmfence.so.1'''.split()
 LIBRARIES += X11_LIBRARIES
+# Platform SONAMEs used by several Proton generations. Keep these in the
+# portable baseline even when no installed Proton is supplied at build time.
+PROTON_PLATFORM_LIBRARIES = '''ld-linux-x86-64.so.2 ld-linux.so.2 libc.so.6 libdl.so.2 libm.so.6
+libpthread.so.0 libresolv.so.2 librt.so.1 libgcc_s.so.1 libstdc++.so.6
+libGL.so.1 libGLX.so.0 libEGL.so.1 libX11.so.6 libX11-xcb.so.1 libXext.so.6
+libXfixes.so.3 libXrandr.so.2 libasound.so.2 libblas.so.3 libbrotlidec.so.1
+libbz2.so.1.0 libcairo.so.2 libdrm.so.2 libdrm_amdgpu.so.1 libgio-2.0.so.0
+libglib-2.0.so.0 libgmodule-2.0.so.0 libgobject-2.0.so.0 libgnutls.so.30
+libgssapi_krb5.so.2 libgudev-1.0.so.0 libjpeg.so.62 liblapack.so.3 liblcms2.so.2
+libmpg123.so.0 libnettle.so.8 libnghttp2.so.14 libogg.so.0 libopenal.so.1 libopus.so.0
+libpango-1.0.so.0 libpangocairo-1.0.so.0 libpcsclite.so.1 libpipewire-0.3.so.0
+libpsl.so.5 libpulse.so.0 libsndfile.so.1 libspeex.so.1 libsqlite3.so.0
+libtheoradec.so.1 libtheoraenc.so.1 libudev.so.1 libusb-1.0.so.0 libva.so.2
+libva-drm.so.2 libva-x11.so.2 libvdpau.so.1 libvorbis.so.0 libvorbisenc.so.2
+libwayland-client.so.0 libwayland-cursor.so.0 libwayland-egl.so.1 libxcb.so.1
+libz.so.1 libzstd.so.1'''.split()
 DATA = ['etc', 'lib/locale/C.utf8', 'share/fonts', 'share/fontconfig', 'share/X11',
         'share/alsa', 'share/zoneinfo', 'share/doc', 'share/ca-certificates',
-        'share/glvnd/egl_vendor.d/10_nvidia.json', 'share/egl/egl_external_platform.d', 'share/vulkan',
+        'share/egl/egl_external_platform.d', 'share/vulkan',
         'share/legion']
 
 
@@ -40,7 +56,7 @@ def vendor(name):
     if name.startswith('libnvidia-egl-gbm.so'):
         return False
     return name.startswith(('libnvidia-', 'libcuda.so', 'libnvcuvid.so',
-                            'libGLX_nvidia.so', 'libEGL_nvidia.so'))
+                            'libGLX_nvidia.so', 'libEGL_nvidia.so', 'libvulkan_nvidia.so'))
 
 
 def virtual_absolute(path):
@@ -209,9 +225,12 @@ def prepare(source, output, protons, programs=()):
         baseline.include('bin/'+name)
     for name in LIBRARIES:
         baseline.library(name, 2, required=name in X11_LIBRARIES or name in
-                         ('libgbm.so.1', 'libdrm.so.2', 'libnvidia-egl-gbm.so.1'))
+                         ('libgbm.so.1', 'libdrm.so.2'))
     for name in ('libfreetype.so.6', 'libfontconfig.so.1'):
         baseline.library(name, 1)
+    for name in PROTON_PLATFORM_LIBRARIES:
+        for architecture in (1, 2):
+            baseline.library(name, architecture, required=False)
     for relative in DATA:
         baseline.include(relative)
     for path in (source/'lib').glob('python3.*'):
@@ -221,16 +240,17 @@ def prepare(source, output, protons, programs=()):
     for directory in ['lib/x86_64-linux-gnu/alsa-lib', 'lib/x86_64-linux-gnu/mangohud',
                       'lib/i386-linux-gnu/alsa-lib']:
         baseline.include(directory)
-    baseline.include('lib/x86_64-linux-gnu/gbm/nvidia-drm_gbm.so')
+    for architecture in ('x86_64-linux-gnu', 'i386-linux-gnu'):
+        baseline.include('lib/'+architecture+'/gstreamer-1.0')
+    baseline.include('lib/ld-linux.so.2')
     baseline.close()
     if baseline.missing:
         raise ValueError('unresolved platform dependencies: '+str(sorted(baseline.missing)))
-    # Use only the NVIDIA ICD and vendor selector in this backend profile.
+    # The runtime builder installs its source-built Venus ICD after slimming.
     for directory in [output/'share/glvnd/egl_vendor.d', output/'share/vulkan/icd.d']:
         if directory.is_dir():
             for path in directory.glob('*.json'):
-                if 'nvidia' not in path.name:
-                    path.unlink()
+                path.unlink()
     files = [p for p in output.rglob('*') if p.is_file() and not p.is_symlink()]
     before_strip = sum(p.stat().st_size for p in files)
     for path in files:
@@ -239,7 +259,7 @@ def prepare(source, output, protons, programs=()):
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     result = dict(schema=1, source_files=len(files), bytes_before_strip=before_strip,
                   bytes=sum(p.stat().st_size for p in files), inspected_elf_objects=len(baseline.processed),
-                  protons=[p.name for p in protons], driver_libraries='read-only host bindings',
+                  protons=[p.name for p in protons], driver_libraries='bundled Venus; host driver stays outside the guest',
                   optional_tool_dependencies_absent_in_full_baseline=sorted(baseline.external_missing),
                   excluded=['Proton binaries','NVIDIA proprietary driver binaries','Mesa software renderers',
                             'locale generators/data sources','debug information'])

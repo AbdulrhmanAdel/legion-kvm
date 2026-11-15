@@ -77,9 +77,13 @@ struct Scanout {
     current: Option<WlBuffer>,
     queued: Option<WlBuffer>,
     frames: u64,
+    cursor: Option<crate::cursor::Cursor>,
 }
 impl Drop for Scanout {
     fn drop(&mut self) {
+        if let Some(cursor) = self.cursor.take() {
+            cursor.destroy(&self.card, self.crtc);
+        }
         // Detach scanout before releasing client storage and destroying FBs.
         let _ = self.card.set_crtc(self.crtc, None, (0, 0), &[], None);
         for buffer in self.queued.take().into_iter().chain(self.current.take()) {
@@ -95,7 +99,7 @@ impl Drop for Scanout {
 }
 
 impl Scanout {
-    fn open() -> Result<Self> {
+    fn open(requested: Option<(u16, u16)>) -> Result<Self> {
         for entry in fs::read_dir("/dev/dri")? {
             let path = entry?.path();
             if !path
@@ -124,8 +128,9 @@ impl Scanout {
                 }
                 let mode = *info
                     .modes()
-                    .first()
-                    .context("virtual display has no mode")?;
+                    .iter()
+                    .find(|mode| requested.is_none_or(|size| mode.size() == size))
+                    .context("virtual display does not offer the requested mode")?;
                 let encoder = info
                     .encoders()
                     .first()
@@ -135,6 +140,7 @@ impl Scanout {
                     .filter_crtcs(encoder.possible_crtcs())
                     .first()
                     .context("virtual display has no CRTC")?;
+                let cursor = Some(crate::cursor::Cursor::new(&card)?);
                 return Ok(Self {
                     card,
                     crtc,
@@ -145,6 +151,7 @@ impl Scanout {
                     current: None,
                     queued: None,
                     frames: 0,
+                    cursor,
                 });
             }
         }
@@ -260,7 +267,14 @@ pub(crate) fn run() -> Result<()> {
         settings["schema"] == 1 && (external || settings["client"] == "cube"),
         "unsupported KMS presentation fixture configuration"
     );
-    let mut scanout = Scanout::open()?;
+    // SDL may publish its tiled window size as the preferred EDID mode.
+    // An explicitly sized fixture must still use its requested render mode.
+    let requested = settings["width"]
+        .as_u64()
+        .zip(settings["height"].as_u64())
+        .map(|(w, h)| Ok::<_, anyhow::Error>((u16::try_from(w)?, u16::try_from(h)?)))
+        .transpose()?;
+    let mut scanout = Scanout::open(requested)?;
     let (width, height) = scanout.mode.size();
     let mut display = Display::<State>::new()?;
     let mut dh = display.handle();
@@ -291,6 +305,7 @@ pub(crate) fn run() -> Result<()> {
         u32::from(height),
     )?;
     state.gpu_only = true;
+    state.diagnose_surfaces = settings["diagnostic_shm"] == true;
     let listener = ListeningSocket::bind(if external {
         "legion-proton-0"
     } else {
@@ -329,6 +344,9 @@ pub(crate) fn run() -> Result<()> {
         ))
     };
     let start = Instant::now();
+    let mut diagnostic_at = Instant::now();
+    let mut input = crate::evdev::Input::open()?;
+    let mut input_at = Instant::now();
     let mut clients = Vec::new();
     loop {
         ensure!(
@@ -340,6 +358,11 @@ pub(crate) fn run() -> Result<()> {
             clients.push(dh.insert_client(stream, Arc::new(ClientState::default()))?);
         }
         display.dispatch_clients(&mut state)?;
+        if input_at.elapsed() >= Duration::from_millis(1) {
+            input_at = Instant::now();
+            let now = u64::try_from(start.elapsed().as_micros())?;
+            state.ordered_input_batch(input.poll(u32::from(width), u32::from(height), now)?, now);
+        }
         for (dma, notifier) in std::mem::take(&mut state.pending_imports) {
             match scanout.import(&dma) {
                 Ok(_) => {
@@ -367,7 +390,34 @@ pub(crate) fn run() -> Result<()> {
             }
         }
         state.send_callbacks(u32::try_from(start.elapsed().as_millis())?);
+        if scanout.current.is_some()
+            && let Some(cursor) = &mut scanout.cursor
+        {
+            cursor.update(
+                &scanout.card,
+                scanout.crtc,
+                &state,
+                u32::try_from(start.elapsed().as_millis())?,
+            )?;
+        }
         display.flush_clients()?;
+        if state.diagnose_surfaces && diagnostic_at.elapsed() >= Duration::from_secs(1) {
+            diagnostic_at = Instant::now();
+            fs::write(
+                "/frames/kms-diagnostics.json.tmp",
+                serde_json::to_vec(&json!({
+                    "schema":1,"surfaces":state.surface_diagnostics(),
+                    "completed_scanouts":scanout.frames,"imports":state.imports,
+                    "source_commits":state.source_commits,"shm_skipped":state.shm_skipped,
+                    "input":state.input_diagnostics()
+                    ,"keyboard_events":state.keyboard_events,"pointer_events":state.pointer_events
+                }))?,
+            )?;
+            fs::rename(
+                "/frames/kms-diagnostics.json.tmp",
+                "/frames/kms-diagnostics.json",
+            )?;
+        }
         if let Some(status) = client
             .as_mut()
             .map(|child| child.0.try_wait())

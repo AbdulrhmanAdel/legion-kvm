@@ -1,6 +1,8 @@
 mod acquire;
 mod acquire_gpu;
 mod animation;
+mod cursor;
+mod evdev;
 mod exit_marker;
 mod forward;
 mod forward_wait;
@@ -133,7 +135,10 @@ fn run() -> Result<()> {
         return kms::run();
     }
     if args.len() == 1 && args[0] == "--offscreen-server" {
-        return offscreen::run();
+        return offscreen::run(false);
+    }
+    if args.len() == 1 && args[0] == "--offscreen-protocol-server" {
+        return offscreen::run(true);
     }
     if args.len() == 1 && args[0] == "--proton-forward" {
         let config = serde_json::from_slice(&fs::read("/frames/proton-forward-config.json")?)?;

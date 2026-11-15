@@ -1,0 +1,24 @@
+--- a/configure.ac
++++ b/configure.ac
+@@ -1427,7 +1427,7 @@
+                             [`test -n "$PKG_CONFIG" && $PKG_CONFIG --variable=wayland_scanner wayland-scanner 2>/dev/null`])],
+               [WAYLAND_CLIENT_LIBS=""],[$WAYLAND_CLIENT_LIBS])])])
+     WINE_PACKAGE_FLAGS(XKBCOMMON,[xkbcommon],,,,
+-        [AC_CHECK_HEADERS([xkbcommon/xkbcommon.h, xkbcommon/xkbcommon-compose.h])
++        [AC_CHECK_HEADERS([xkbcommon/xkbcommon.h xkbcommon/xkbcommon-compose.h])
+          AC_CHECK_LIB(xkbcommon,xkb_context_new,[:],[XKBCOMMON_LIBS=""],[$XKBCOMMON_LIBS])])
+     WINE_PACKAGE_FLAGS(XKBREGISTRY,[xkbregistry],,,,
+         [AC_CHECK_LIB(xkbregistry,rxkb_context_new,[:],[XKBREGISTRY_LIBS=""],[$XKBREGISTRY_LIBS])])
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -38,6 +38,10 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(keyboard);
+ WINE_DECLARE_DEBUG_CHANNEL(key);
++
++#ifndef XKB_VMOD_NAME_SCROLL
++#define XKB_VMOD_NAME_SCROLL "ScrollLock"
++#endif
+ 
+ struct layout
+ {

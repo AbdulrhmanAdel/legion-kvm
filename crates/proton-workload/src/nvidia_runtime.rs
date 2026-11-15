@@ -25,15 +25,23 @@ impl NvidiaRuntime {
             if count == 0 {
                 continue;
             }
-            ensure!(
-                count == 2,
-                "incomplete NVIDIA NGX driver bridge in {}",
-                directory.display()
-            );
-            return Ok(Some(Self {
+            if count != 2 {
+                eprintln!(
+                    "legion: optional NVIDIA NGX bridge is incomplete; continuing without it"
+                );
+                continue;
+            }
+            let bridge = Self {
                 driver_directory: directory,
                 proton_directory: proton.to_owned(),
-            }));
+            };
+            if bridge.proton_dll("nvapi64.dll", false).is_none() {
+                eprintln!(
+                    "legion: selected Proton has no NVAPI bridge; continuing without NGX injection"
+                );
+                return Ok(None);
+            }
+            return Ok(Some(bridge));
         }
         Ok(None)
     }

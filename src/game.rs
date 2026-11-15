@@ -1,5 +1,5 @@
 //! Launch the selected installed Proton inside the bundled game runtime.
-use crate::{gpu_transport, memory, packed, probe, qemu_policy, runtime::Runtime};
+use crate::{packed, probe, runtime::Runtime};
 use anyhow::{Context, Result, ensure};
 use legion_shared_directories::Source;
 use sha2::{Digest, Sha256};
@@ -42,7 +42,69 @@ fn output() -> Result<PathBuf> {
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let path = root.join(format!("{stamp}-{}", std::process::id()));
     fs::DirBuilder::new().mode(0o700).create(&path)?;
+    fs::write(
+        path.join("build.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version":env!("CARGO_PKG_VERSION"),
+            "build":option_env!("LEGION_BUILD_ID").unwrap_or("development")
+        }))?,
+    )?;
     Ok(path)
+}
+
+/// Exercise the real guest graphics path without opening a game or Wine prefix.
+pub(crate) fn graphics_check() -> Result<()> {
+    let runtime = Runtime::load(None)?;
+    let prerequisites = runtime.inspect();
+    ensure!(
+        prerequisites.passed,
+        "graphics prerequisites failed: {}",
+        serde_json::to_string_pretty(&prerequisites)?
+    );
+    let out = output()?;
+    eprintln!("legion: Graphics test logs: {}", out.display());
+    let args = graphics_args(
+        &runtime,
+        &runtime.asset(&runtime.manifest.userspace)?,
+        &out.join("vm"),
+    )?;
+    crate::venus::run(&args)
+}
+
+/// All hosts use the same virtual GPU and guest Vulkan driver.
+fn graphics_args(runtime: &Runtime, userspace: &Path, output: &Path) -> Result<Vec<OsString>> {
+    let node = crate::graphics::detect()?.node;
+    let m = &runtime.manifest;
+    let mut args = vec![
+        "--gpu-backend".into(),
+        "venus".into(),
+        "--qemu".into(),
+        runtime.tool("legion-qemu").into(),
+        "--kernel".into(),
+        runtime.asset(&m.kernel)?.into(),
+        "--init".into(),
+        runtime.asset(&m.init)?.into(),
+        "--userspace".into(),
+        userspace.into(),
+        "--virtiofsd".into(),
+        runtime.tool("legion-virtiofsd").into(),
+        "--output".into(),
+        output.into(),
+        "--render-node".into(),
+        node.into(),
+        "--memory-mib".into(),
+        "2048".into(),
+        "--window".into(),
+        "true".into(),
+        "--window-renderer".into(),
+        "desktop".into(),
+        "--window-system".into(),
+        std::env::var_os("LEGION_WINDOW_SYSTEM").unwrap_or_else(|| "auto".into()),
+    ];
+    for module in &m.modules {
+        args.extend(["--module".into(), runtime.asset(module)?.into()]);
+    }
+    Ok(args)
 }
 
 pub(crate) fn cpu_check(args: &[OsString]) -> Result<()> {
@@ -188,22 +250,10 @@ fn copy(source: &Path, target: &Path) -> Result<()> {
 pub(crate) fn run(args: &[OsString]) -> Result<()> {
     let request = parse(args)?;
     let runtime = Runtime::load(None)?;
-    let graphics = crate::graphics::detect()?;
-    let amd = matches!(graphics, crate::graphics::Graphics::Amd(_));
-    let display_backend = std::env::var("LEGION_DISPLAY_BACKEND")
-        .map(Some)
-        .or_else(|error| match error {
-            std::env::VarError::NotPresent => Ok(None),
-            error => Err(error),
-        })?;
-    if let Some(backend) = &display_backend {
+    if let Ok(backend) = std::env::var("LEGION_DISPLAY_BACKEND") {
         ensure!(
-            matches!(backend.as_str(), "auto" | "wayland" | "xwayland"),
-            "LEGION_DISPLAY_BACKEND must be auto, wayland or xwayland"
-        );
-        ensure!(
-            !amd || backend != "xwayland",
-            "the AMD display backend requires Wayland"
+            matches!(backend.as_str(), "auto" | "wayland"),
+            "Venus requires the guest Wayland display backend; unset LEGION_DISPLAY_BACKEND or use wayland"
         );
     }
     let report = runtime.inspect();
@@ -238,24 +288,20 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
     let out = output()?;
     eprintln!("legion: Session logs: {}", out.display());
     copy(
-        &runtime.asset(if amd {
-            &runtime
-                .manifest
-                .amdgpu
-                .as_ref()
-                .context("runtime has no AMD graphics assets")?
-                .userspace
-        } else {
-            &runtime.manifest.userspace
-        })?,
+        &runtime.asset(&runtime.manifest.userspace)?,
         &out.join("usr"),
     )?;
     let fixture = out.join("usr/share/legion");
-    let overlay = crate::wine_recipe::prepare(
-        &fixture.join("wine-repair.json"),
-        &request.proton,
-        &fixture.join("compatibility/ntdll.dll"),
-    )?;
+    let repair = crate::wine_recipe::enabled(std::env::var("LEGION_WINE_REPAIR").ok().as_deref())?;
+    let overlay = if repair {
+        Some(crate::wine_recipe::prepare(
+            &fixture.join("wine-repair.json"),
+            &request.proton,
+            &fixture.join("compatibility/ntdll.dll"),
+        ).context("optional Wine repair cannot be used with this Proton; unset LEGION_WINE_REPAIR to use stock Proton")?)
+    } else {
+        None
+    };
     let home =
         PathBuf::from(std::env::var_os("HOME").context("HOME is missing")?).canonicalize()?;
     let key = format!(
@@ -327,19 +373,6 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
     )
     .context("this prefix already has a Legion session")?;
-    let driver_libraries = if amd {
-        Default::default()
-    } else {
-        crate::driver_libraries::stage(&out.join("usr"), &mut shares)?
-    };
-    let nvidia = Path::new("/usr/lib/nvidia/wine");
-    if !amd && nvidia.join("nvngx.dll").is_file() && nvidia.join("_nvngx.dll").is_file() {
-        shares.push(Source {
-            tag: "nvidia-wine".into(),
-            directory: nvidia.to_owned(),
-            readonly: true,
-        });
-    }
     let uid = rustix::process::getuid().as_raw();
     let gid = rustix::process::getgid().as_raw();
     ensure!(uid != 0, "run Legion as your desktop user");
@@ -355,37 +388,36 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
     )?;
     let mut launch: serde_json::Value =
         serde_json::from_slice(&fs::read(fixture.join("game-launch.json"))?)?;
-    if let Some(backend) = display_backend {
-        launch["display_backend"] = backend.into();
-    }
     let mut overrides = std::env::var("WINEDLLOVERRIDES").unwrap_or_default();
-    for (name, value) in [
-        ("winmm", "n,b"),
-        ("steam_api64", "n,b"),
-        ("steamclient64", "n,b"),
-        ("lsteamclient", "d"),
-        ("dxgi", "n"),
-        ("d3d12", "n"),
-        ("d3d12core", "n"),
-        ("d3d11", "n"),
-        ("wineopenxr", "d"),
-    ] {
-        if !overrides
-            .split(';')
-            .filter_map(|v| v.split_once('='))
-            .any(|(names, _)| {
-                names
-                    .split(',')
-                    .any(|n| n.trim().eq_ignore_ascii_case(name))
-            })
-        {
-            if !overrides.is_empty() {
-                overrides.push(';');
+    if repair {
+        for (name, value) in [
+            ("winmm", "n,b"),
+            ("steam_api64", "n,b"),
+            ("steamclient64", "n,b"),
+            ("lsteamclient", "d"),
+            ("dxgi", "n"),
+            ("d3d12", "n"),
+            ("d3d12core", "n"),
+            ("d3d11", "n"),
+            ("wineopenxr", "d"),
+        ] {
+            if !overrides
+                .split(';')
+                .filter_map(|v| v.split_once('='))
+                .any(|(names, _)| {
+                    names
+                        .split(',')
+                        .any(|n| n.trim().eq_ignore_ascii_case(name))
+                })
+            {
+                if !overrides.is_empty() {
+                    overrides.push(';');
+                }
+                overrides.push_str(&format!("{name}={value}"));
             }
-            overrides.push_str(&format!("{name}={value}"));
         }
     }
-    let environment: BTreeMap<String, String> = std::env::vars()
+    let mut environment: BTreeMap<String, String> = std::env::vars()
         .filter(|(k, _)| {
             k.starts_with("PROTON_")
                 || k.starts_with("DXVK_")
@@ -402,16 +434,18 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
         })
         .collect();
     launch["proton_path"] = serde_json::json!(request.proton);
-    if amd {
-        launch["vulkan_driver"] = "radv".into();
-        launch["nvidia_features"] = false.into();
-        launch["display_backend"] = "wayland".into();
-        launch["desktop_audio"] = true.into();
-    }
+    launch["vulkan_driver"] = "venus".into();
+    launch["nvidia_features"] = false.into();
+    launch["display_backend"] = "wayland".into();
+    launch["desktop_audio"] = true.into();
+    environment.insert(
+        "VN_PERF".into(),
+        "no_timeline_sync,no_query_feedback".into(),
+    );
+    environment.insert("VN_FEEDBACK_SPIN_US".into(), "200".into());
     launch["uid"] = uid.into();
     launch["gid"] = gid.into();
-    launch["wine_overlay"] = overlay;
-    launch["ephemeral_wine_overlay"] = true.into();
+    crate::wine_recipe::configure(&mut launch, overlay);
     launch["mangohud"] = std::env::var("MANGOHUD").is_ok_and(|v| v == "1").into();
     launch["environment"] = serde_json::to_value(environment)?;
     launch["host_paths"] = serde_json::json!({"home":home,"proton":request.proton,"application":request.root,"compatdata":compatdata,"wine_prefix":wine_prefix});
@@ -421,116 +455,42 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
         serde_json::to_vec_pretty(&launch)?,
     )?;
     fs::write(out.join("launch.json"), serde_json::to_vec_pretty(&launch)?)?;
-    let config = serde_json::from_slice(&fs::read(
-        runtime.asset(&runtime.manifest.workload_config)?,
-    )?)?;
-    if let crate::graphics::Graphics::Amd(node) = &graphics {
-        let assets = runtime
-            .manifest
-            .amdgpu
-            .as_ref()
-            .context("AMD runtime assets missing")?;
-        let shares_path = out.join("shares.json");
-        fs::write(
-            &shares_path,
-            serde_json::to_vec_pretty(&legion_shared_directories::Sources {
-                schema: 1,
-                directories: shares,
-            })?,
-        )?;
-        let display_path = out.join("kms.json");
-        fs::write(
-            &display_path,
-            serde_json::to_vec_pretty(
-                &serde_json::json!({"schema":1,"client":"external","application":true,"width":1920,"height":1080,
-                    "fullscreen":std::env::var("LEGION_FULLSCREEN").is_ok_and(|value|value=="1")}),
-            )?,
-        )?;
-        let mut args = vec![
-            OsString::from("--qemu"),
-            runtime.tool("legion-amdgpu-qemu").into(),
-            "--kernel".into(),
-            runtime.asset(&assets.kernel)?.into(),
-            "--init".into(),
-            runtime.asset(&assets.init)?.into(),
-            "--userspace".into(),
-            out.join("usr").into(),
-            "--virtiofsd".into(),
-            runtime.tool("legion-virtiofsd").into(),
-            "--output".into(),
-            out.join("vm").into(),
-            "--render-node".into(),
-            node.clone().into(),
-            "--shares".into(),
-            shares_path.into(),
-            "--workload".into(),
-            fixture.join("bootstrap").into(),
-            "--workload-config".into(),
-            runtime.asset(&runtime.manifest.workload_config)?.into(),
-            "--presentation-config".into(),
-            display_path.into(),
-            "--window".into(),
-            "true".into(),
-            "--window-renderer".into(),
-            "desktop".into(),
-            "--memory-mib".into(),
-            memory_mib.to_string().into(),
-            "--interactive".into(),
-            "true".into(),
-            "--application".into(),
-            "true".into(),
-            "--audio".into(),
-            "desktop".into(),
-        ];
-        for path in &assets.modules {
-            args.extend(["--module".into(), runtime.asset(path)?.into()]);
-        }
-        return crate::native_context::run(&args);
-    }
-    let boot = gpu_transport::DriverBoot {
-        kernel: runtime.asset(&runtime.manifest.kernel)?,
-        init: runtime.asset(&runtime.manifest.init)?,
-        modules: runtime
-            .manifest
-            .modules
-            .iter()
-            .map(|p| runtime.asset(p))
-            .collect::<Result<_>>()?,
-        ram_mode: memory::Mode::Aligned,
-        qemu_hugepages: qemu_policy::HugePages::default(),
-        memory_mib: Some(memory_mib),
-        vulkan: Some(gpu_transport::VulkanBoot {
-            compute: true,
-            userspace: out.join("usr"),
-            virtiofsd: runtime.tool("legion-virtiofsd"),
-            draw: None,
-            presentation: None,
-            forward_display: Some((1920, 1080)),
-            desktop_audio: true,
-            shares,
-            driver_libraries,
-            workload: Some(gpu_transport::WorkloadBoot {
-                program: fixture.join("bootstrap"),
-                config,
-                timeout_seconds: None,
-                interactive: true,
-            }),
-        }),
-    };
-    let result = gpu_transport::run(
-        &runtime.tool("legion-backend"),
-        &runtime.tool("legion-qemu"),
-        &out.join("vm"),
-        probe::Machine::Q35,
-        Some(&boot),
+    let shares_path = out.join("shares.json");
+    fs::write(
+        &shares_path,
+        serde_json::to_vec_pretty(&legion_shared_directories::Sources {
+            schema: 1,
+            directories: shares,
+        })?,
     )?;
-    ensure!(
-        result.error.is_none(),
-        "game session failed: {}; logs: {}",
-        result.error.unwrap_or_default(),
-        out.display()
-    );
-    Ok(())
+    let display_path = out.join("kms.json");
+    fs::write(
+        &display_path,
+        serde_json::to_vec_pretty(
+            &serde_json::json!({"schema":1,"client":"external","application":true,"width":1920,"height":1080,
+        "fullscreen":std::env::var("LEGION_FULLSCREEN").is_ok_and(|v|v=="1")}),
+        )?,
+    )?;
+    let mut args = graphics_args(&runtime, &out.join("usr"), &out.join("vm"))?;
+    args.extend([
+        "--shares".into(),
+        shares_path.into(),
+        "--workload".into(),
+        fixture.join("bootstrap").into(),
+        "--workload-config".into(),
+        runtime.asset(&runtime.manifest.workload_config)?.into(),
+        "--presentation-config".into(),
+        display_path.into(),
+        "--memory-mib".into(),
+        memory_mib.to_string().into(),
+        "--interactive".into(),
+        "true".into(),
+        "--application".into(),
+        "true".into(),
+        "--audio".into(),
+        "desktop".into(),
+    ]);
+    crate::venus::run(&args)
 }
 
 #[cfg(test)]

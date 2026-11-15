@@ -1,11 +1,13 @@
 use super::*;
 #[test]
-fn other_gpu_runtime_is_untouched_and_partial_driver_install_is_reported() -> Result<()> {
+fn missing_optional_nvidia_features_do_not_block_other_games() -> Result<()> {
     let root = tempfile::tempdir()?;
     assert!(NvidiaRuntime::discover(root.path(), root.path())?.is_none());
     fs::create_dir_all(root.path().join("lib/nvidia/wine"))?;
     fs::write(root.path().join("lib/nvidia/wine/nvngx.dll"), b"fixture")?;
-    assert!(NvidiaRuntime::discover(root.path(), root.path()).is_err());
+    assert!(NvidiaRuntime::discover(root.path(), root.path())?.is_none());
+    fs::write(root.path().join("lib/nvidia/wine/_nvngx.dll"), b"fixture")?;
+    assert!(NvidiaRuntime::discover(root.path(), root.path())?.is_none());
     Ok(())
 }
 #[test]

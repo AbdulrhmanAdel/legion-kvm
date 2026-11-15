@@ -25,6 +25,3 @@ jobs:
       - run: cargo check --locked --workspace --all-targets --all-features
       - run: cargo test --locked --workspace --all-features
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - run: cargo fmt --all --manifest-path backends/nvidia/Cargo.toml --check
-      - run: cargo clippy --locked --workspace --all-targets --manifest-path backends/nvidia/Cargo.toml --features device/vhost-user -- -D warnings
-      - run: cargo test --locked --workspace --manifest-path backends/nvidia/Cargo.toml --features device/vhost-user

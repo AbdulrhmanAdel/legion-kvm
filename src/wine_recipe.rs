@@ -4,6 +4,30 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 
+pub(crate) fn enabled(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        _ => anyhow::bail!("LEGION_WINE_REPAIR must be 0 or 1"),
+    }
+}
+
+/// Version-specific CPU/Wine hooks must never be injected into stock Proton.
+pub(crate) fn configure(launch: &mut serde_json::Value, overlay: Option<serde_json::Value>) {
+    let repaired = overlay.is_some();
+    launch["wine_overlay"] = overlay.into();
+    launch["ephemeral_wine_overlay"] = repaired.into();
+    for key in [
+        "cpu_adapter",
+        "kuser_worker",
+        "nt_syscall_audit",
+        "wine_dispatch_audit",
+        "resolver_bridge",
+    ] {
+        launch[key] = repaired.into();
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Recipe {

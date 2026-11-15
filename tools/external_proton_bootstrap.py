@@ -145,7 +145,7 @@ def main():
             raise RuntimeError('selected Proton requires the guest XWayland executable')
         Path('/tmp/.X11-unix').mkdir(exist_ok=True)
         os.chmod('/tmp/.X11-unix', 0o1777)
-    env = dict(PATH='/usr/bin', HOME='/frames/home', XDG_RUNTIME_DIR=runtime,
+    env = dict(PATH='/usr/bin', HOME='/frames/home', PWD=str(install), XDG_RUNTIME_DIR=runtime,
                XDG_CACHE_HOME='/frames/cache', PYTHONHOME='/usr', PYTHONDONTWRITEBYTECODE='1',
                LD_LIBRARY_PATH='/usr/lib:/usr/lib/x86_64-linux-gnu:/usr/lib/i386-linux-gnu',
                LANG='C.UTF-8', WAYLAND_DISPLAY='legion-host-0' if native and not config.get('native_forward') else 'legion-proton-0', PROTON_ENABLE_WAYLAND='1',

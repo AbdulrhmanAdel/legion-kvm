@@ -39,7 +39,19 @@ fn guest_updates_and_first_image_finish_startup_observation() {
     let frames = output.path().join("frames");
     fs::create_dir(&frames).expect("frames");
     let mut progress = Progress::new(output.path(), false);
-    for stage in ["preparing-runtime", "starting-application"] {
+    fs::write(
+        frames.join("guest-stage.json"),
+        r#"{"schema":1,"stage":"vulkaninfo"}"#,
+    )
+    .expect("guest stage");
+    progress.last_poll = Instant::now() - Duration::from_secs(1);
+    progress.poll();
+    assert!(progress.stage == Some(Stage::CheckingVulkan));
+    for stage in [
+        "starting-display",
+        "preparing-runtime",
+        "starting-application",
+    ] {
         fs::write(
             frames.join("startup-status.json"),
             serde_json::json!({"schema":1,"stage":stage}).to_string(),

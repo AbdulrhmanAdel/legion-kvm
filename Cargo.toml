@@ -34,9 +34,8 @@ unwrap_used = "deny"
 
 [workspace]
 resolver = "2"
-members = [".", "crates/cpu-adapter", "crates/cpu-contract", "crates/cpu-topology", "crates/display-channel", "crates/display-probe", "crates/gpu-presenter", "crates/guest-compositor", "crates/guest-probe", "crates/kvm-capabilities", "crates/proton-workload", "crates/shared-directories", "crates/workload-probe"]
+members = [".", "crates/cpu-adapter", "crates/cpu-contract", "crates/cpu-topology", "crates/display-channel", "crates/guest-compositor", "crates/guest-probe", "crates/kvm-capabilities", "crates/proton-workload", "crates/shared-directories", "crates/workload-probe"]
 default-members = ["."]
-exclude = ["backends/nvidia"]
 
 [workspace.package]
 version = "0.1.0"

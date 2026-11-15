@@ -10,7 +10,6 @@ use std::{
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
-    Legacy,
     #[default]
     Aligned,
 }
@@ -41,17 +40,6 @@ impl Ram {
             .checked_mul(1024 * 1024)
             .filter(|&n| n > 0)
             .ok_or_else(|| anyhow::anyhow!("invalid guest RAM size"))?;
-        if matches!(mode, Mode::Legacy) {
-            return Ok(Self {
-                _backing: None,
-                info: Info {
-                    mode,
-                    size_mib,
-                    requested_alignment_bytes: None,
-                },
-                argument: format!("memory-backend-memfd,id=ram,size={size_mib}M,share=on"),
-            });
-        }
         let hint = fs::read_to_string("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size").ok();
         let alignment = alignment(hint.as_deref());
         let fd = memfd_create(

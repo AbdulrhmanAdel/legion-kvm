@@ -4,10 +4,6 @@ The main Rust workspace includes the Legion CPU compatibility implementation,
 licensed under GNU AGPL version 3. Its existing license and copyright notice
 are retained in LICENSE and crates/cpu-contract/LICENSE.
 
-The NVIDIA backend contains components under Apache-2.0, BSD-3-Clause and
-GPL-2.0-or-later. The original license texts are retained in backends/nvidia.
-Its guest driver retains its GPL-2.0 SPDX identifier.
-
 The guest CPU module is GPL-2.0. Changes to Linux and QEMU are distributed
 under the corresponding upstream licenses. Runtime images may include other
 components; their source notices must accompany redistributed runtime images.

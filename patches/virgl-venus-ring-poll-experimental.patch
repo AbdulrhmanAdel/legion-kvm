@@ -1,0 +1,121 @@
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -185,8 +185,37 @@
+    return ns_per_sec * now.tv_sec + now.tv_nsec;
+ }
+ 
+-static void
+-vkr_ring_relax(uint32_t *iter)
++/* Experimental host-side active-poll budget; zero preserves the original policy. */
++static uint64_t
++vkr_ring_spin_budget_ns(void)
++{
++   const char *value = getenv("LEGION_VENUS_RING_SPIN_US");
++   if (!value || !*value)
++      return 0;
++
++   char *end;
++   errno = 0;
++   const unsigned long us = strtoul(value, &end, 10);
++   if (errno || *end || us > 200)
++      return 0;
++   return us * 1000;
++}
++
++static inline void
++vkr_ring_cpu_relax(void)
++{
++#if defined(__i386__) || defined(__x86_64__)
++   __builtin_ia32_pause();
++#elif defined(__aarch64__)
++   __asm__ __volatile__("yield");
++#else
++   atomic_signal_fence(memory_order_seq_cst);
++#endif
++}
++
++static void
++vkr_ring_relax(uint32_t *iter, bool measure,
++               uint64_t *yields, uint64_t *sleeps)
+ {
+    /* TODO do better */
+    const uint32_t busy_wait_order = 4;
+@@ -194,6 +223,8 @@
+ 
+    (*iter)++;
+    if (*iter < (1u << busy_wait_order)) {
++      if (measure)
++         (*yields)++;
+       thrd_yield();
+       return;
+    }
+@@ -204,6 +235,8 @@
+       .tv_sec = us / 1000000,
+       .tv_nsec = (us % 1000000) * 1000,
+    };
++   if (measure)
++      (*sleeps)++;
+    clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
+ }
+ 
+@@ -261,6 +294,9 @@
+ 
+    uint64_t last_submit = vkr_ring_now();
+    uint32_t relax_iter = 0;
++   const uint64_t spin_ns = vkr_ring_spin_budget_ns();
++   const bool measure = getenv("LEGION_VENUS_RING_STATS") != NULL;
++   uint64_t batches = 0, spins = 0, yields = 0, sleeps = 0, idle_waits = 0;
+    int ret = 0;
+    while (ring->started) {
+       bool wait = false;
+@@ -273,6 +309,8 @@
+       }
+ 
+       if (wait) {
++         if (measure)
++            idle_waits++;
+          TRACE_SCOPE("ring idle");
+ 
+          mtx_lock(&ring->mutex);
+@@ -290,6 +328,8 @@
+ 
+       const uint32_t cmd_size = vkr_ring_load_tail(ring) - ring->buffer.cur;
+       if (cmd_size) {
++         if (measure)
++            batches++;
+          if (cmd_size > ring->buffer.size) {
+             vkr_log("%s: cmd_size(%u) > ring->buffer.size(%u)", __func__, cmd_size,
+                     ring->buffer.size);
+@@ -324,7 +364,17 @@
+             }
+          }
+ 
+-         vkr_ring_relax(&relax_iter);
++         /* Keep the existing idle notification and backoff protocol. Only
++          * replace the first bounded interval after a submission with PAUSE.
++          * No fence or semaphore completion is inferred from polling here.
++          */
++         if (spin_ns && vkr_ring_now() - last_submit < spin_ns) {
++            if (measure)
++               spins++;
++            vkr_ring_cpu_relax();
++         } else {
++            vkr_ring_relax(&relax_iter, measure, &yields, &sleeps);
++         }
+       }
+    }
+ 
+@@ -332,6 +382,13 @@
+       vkr_ring_set_status_bits(ring, VK_RING_STATUS_FATAL_BIT_MESA);
+       vkr_context_on_ring_fatal(ctx);
+    }
++
++   if (measure)
++      vkr_log("LEGION_VENUS_RING_STATS ctx=%d ring=%" PRIu64
++              " spin_ns=%" PRIu64 " batches=%" PRIu64 " spins=%" PRIu64
++              " yields=%" PRIu64 " sleeps=%" PRIu64 " idle_waits=%" PRIu64,
++              ctx->ctx_id, (uint64_t)ring->id, spin_ns, batches, spins,
++              yields, sleeps, idle_waits);
+ 
+    return ret;
+ }

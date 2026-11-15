@@ -11,6 +11,7 @@ description = "Proton application runtime and rendering utilities"
 gpu-clock-probe = ["dep:ash"]
 driver-context-probe = []
 syscall-count-probe = []
+d3d11-probe = ["windows/Win32_Graphics_Direct3D11"]
 
 [dependencies]
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"] }

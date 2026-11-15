@@ -16,7 +16,6 @@ def copy_notices(source, destination):
 
 def collect(repository, sources, cargo, destination):
     copy_notices(repository, destination/'legion')
-    copy_notices(repository/'backends/nvidia', destination/'nvidia')
     for source in sources.iterdir():
         if source.is_dir():
             copy_notices(source, destination/'sources'/source.name)

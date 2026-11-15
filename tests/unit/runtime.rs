@@ -2,8 +2,8 @@ use super::*;
 
 fn fixture(root: &Path) -> Runtime {
     let manifest = serde_json::from_value(serde_json::json!({
-        "schema":1,"nvidia_driver":"1.2.3","qemu":"owned","qemu_data":"owned",
-        "backend":"owned","virtiofsd":"owned","host_loader":"owned",
+        "schema":2,"qemu":"owned","qemu_data":"owned",
+        "renderer":"owned","virtiofsd":"owned","host_loader":"owned",
         "host_libraries":"owned","kernel":"owned","init":"owned",
         "modules":["owned"],"userspace":"owned","workload_config":"owned"
     }))

@@ -14,18 +14,23 @@ fn selected_gpu() -> Result<GpuKind> {
     GpuKind::from_cmdline(&fs::read_to_string("/proc/cmdline")?)
 }
 
-pub fn report() -> Value {
-    match inspect() {
-        Ok(report) => report,
-        Err(error) => json!({"schema": 1, "passed": false, "error": format!("{error:#}")}),
-    }
-}
-
 pub fn vulkan_report() -> Value {
     match inspect_vulkan() {
         Ok(report) => report,
         Err(error) => json!({"schema": 1, "passed": false, "error": format!("{error:#}")}),
     }
+}
+
+fn record_stage(stage: &str) -> Result<()> {
+    use std::io::Write;
+    let status = json!({"schema":1,"stage":stage});
+    println!("LEGION_GUEST_STAGE {status}");
+    std::io::stdout().flush()?;
+    if Path::new("/frames").is_dir() {
+        fs::write("/frames/guest-stage.json.tmp", serde_json::to_vec(&status)?)?;
+        fs::rename("/frames/guest-stage.json.tmp", "/frames/guest-stage.json")?;
+    }
+    Ok(())
 }
 
 /// Generic virtio-GPU plumbing, not a claim of hardware rendering.
@@ -83,6 +88,23 @@ fn inspect_drm() -> Result<Value> {
 }
 
 fn inspect_vulkan() -> Result<Value> {
+    ensure!(
+        std::process::id() == 1,
+        "guest graphics initialization requires PID1"
+    );
+    // These are the disposable guest's virtual devices, not host input nodes.
+    if Path::new("/dev/input").is_dir() {
+        use std::os::unix::fs::FileTypeExt;
+        for entry in fs::read_dir("/dev/input")? {
+            let entry = entry?;
+            if entry.file_name().as_encoded_bytes().starts_with(b"event")
+                && entry.file_type()?.is_char_device()
+            {
+                fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o666))?;
+            }
+        }
+    }
+    record_stage("mounting guest userspace")?;
     for tag in ["usr", "frames"] {
         let target = format!("/{tag}");
         fs::create_dir_all(&target)?;
@@ -99,6 +121,7 @@ fn inspect_vulkan() -> Result<Value> {
         )
         .with_context(|| format!("mount guest share {tag}"))?;
     }
+    record_stage("mounting shared directories and graphics libraries")?;
     // Mount only explicitly exported extra directories under a dedicated root.
     let shares = Path::new("/frames").join(legion_shared_directories::MANIFEST);
     if shares.exists() {
@@ -109,17 +132,6 @@ fn inspect_vulkan() -> Result<Value> {
         let manifest: legion_shared_directories::Manifest =
             serde_json::from_slice(&fs::read(shares)?)?;
         manifest.validate()?;
-        let libraries = Path::new("/frames").join(legion_shared_directories::LIBRARY_MANIFEST);
-        let bindings: legion_shared_directories::LibraryBindings = if libraries.is_file() {
-            ensure!(
-                fs::metadata(&libraries)?.len() <= legion_shared_directories::MAX_MANIFEST_BYTES,
-                "driver library manifest exceeds size bound"
-            );
-            serde_json::from_slice(&fs::read(libraries)?)?
-        } else {
-            Default::default()
-        };
-        bindings.validate(&manifest)?;
         let mut mounted = Vec::new();
         for share in manifest.mounts {
             let target = share.target();
@@ -151,28 +163,6 @@ fn inspect_vulkan() -> Result<Value> {
             });
         }
         fs::write("/frames/mounted-shares.json", serde_json::to_vec(&mounted)?)?;
-        for file in &bindings.files {
-            let source = Path::new(legion_shared_directories::GUEST_ROOT)
-                .join(&file.tag)
-                .join(&file.source_name);
-            let target = Path::new("/usr/lib").join(&file.target_name);
-            ensure!(
-                source.is_file() && target.is_file() && !target.is_symlink(),
-                "driver library source/placeholder missing"
-            );
-            mount(&source, &target, "", MountFlags::BIND, None)
-                .with_context(|| format!("bind host driver library {}", file.target_name))?;
-            ensure!(
-                rustix::fs::statvfs(&target)?
-                    .f_flag
-                    .contains(rustix::fs::StatVfsMountFlags::RDONLY),
-                "driver library binding did not retain read-only access"
-            );
-        }
-        fs::write(
-            "/frames/mounted-driver-libraries.json",
-            serde_json::to_vec(&bindings)?,
-        )?;
     }
     // Development userspace layout.
     for (name, target) in [
@@ -196,44 +186,31 @@ fn inspect_vulkan() -> Result<Value> {
         Some(c"mode=1777,size=64m"),
     )?;
     let expected = selected_gpu()?;
-    let dependencies = if expected == GpuKind::Amd {
-        let check = run_vulkan_program(
-            "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
-            &["--list", "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so"],
-            "radv-dependencies",
-        )?;
-        if check["success"] != true {
-            return Ok(
-                json!({"schema":1,"passed":false,"enumeration_verified":false,"draw_verified":false,
-                "expected_vendor":expected.vendor_id(),"selected_icd":expected.icd(),
-                "driver_dependency_check":check,"error":"RADV guest dependencies failed to load"}),
-            );
-        }
-        Some(check)
-    } else {
-        None
-    };
     let info = run_vulkan_program("/usr/bin/vulkaninfo", &["--summary"], "vulkaninfo")?;
     let text = info["stdout"].as_str().unwrap_or_default();
-    let vendor = text.lines().any(|line| {
-        line.split_once('=').is_some_and(|(key, value)| {
-            key.trim() == "vendorID" && value.trim() == expected.vendor_id()
-        })
-    });
+    let selection = super::gpu_kind::verify_host_gpu(&fs::read_to_string("/proc/cmdline")?, text);
+    let vendor = text.contains("DRIVER_ID_MESA_VENUS");
     let hardware = text.lines().any(|line| {
         line.split_once('=').is_some_and(|(key, value)| {
             key.trim() == "deviceType"
                 && (value.contains("DISCRETE_GPU") || value.contains("INTEGRATED_GPU"))
         })
     });
-    if info["success"] != true || !vendor || !hardware {
+    if info["success"] != true || !vendor || !hardware || selection.is_err() {
         return Ok(
             json!({"schema": 1, "passed": false, "enumeration_verified": false, "draw_verified": false,
                 "expected_vendor":expected.vendor_id(),"selected_icd":expected.icd(),
-                "driver_dependency_check":dependencies,
-                "vulkaninfo": info, "error": "selected hardware Vulkan enumeration failed"}),
+
+                "vulkaninfo": info, "error": selection.err().map_or_else(|| "selected hardware Vulkan enumeration failed".to_owned(), |error| error.to_string())}),
         );
     }
+    fs::write(
+        "/frames/vulkan-enumeration.json",
+        serde_json::to_vec(&json!({
+            "schema":1,"passed":true,"enumeration_verified":true,"draw_verified":false,
+            "vulkaninfo":info,"expected_vendor":expected.vendor_id()
+        }))?,
+    )?;
     let draw = if Path::new("/probe-draw").is_file() {
         Some(run_vulkan_program(
             "/probe-draw",
@@ -285,7 +262,7 @@ fn inspect_vulkan() -> Result<Value> {
     Ok(json!({
         "schema": 1, "passed": passed, "enumeration_verified": true,
         "draw_verified": draw_verified, "vulkaninfo": info, "draw": draw,
-        "driver_dependency_check":dependencies,
+
         "display": display,
         "workload": workload, "workload_gpu_verified": workload_gpu_verified,
         "interrupts": interrupt_report()?,
@@ -293,10 +270,6 @@ fn inspect_vulkan() -> Result<Value> {
         "idle_governor": read_sysfs("/sys/devices/system/cpu/cpuidle/current_governor_ro"),
         "haltpoll_ns": read_sysfs("/sys/module/haltpoll/parameters/guest_halt_poll_ns"),
         "cpu_environment": cpu_environment(),
-        "graphics_sync": match graphics_sync() {
-            Ok(value) => value,
-            Err(error) => json!({"error":format!("{error:#}")}),
-        },
         "error": if passed { None::<&str> } else { Some("offscreen draw or pixel verification failed") },
     }))
 }
@@ -347,42 +320,7 @@ fn drm_driver_name(file: &File) -> Result<String> {
     String::from_utf8(driver_name[..version.name_len].to_vec()).map_err(Into::into)
 }
 
-/// Query NVIDIA proxy capabilities after timing; an unsupported query remains diagnostic data rather than a rendering failure.
-fn graphics_sync() -> Result<Value> {
-    use rustix::ioctl::{Opcode, Updater, ioctl, opcode};
-    // NVIDIA's current GET_DEV_INFO ABI is nine u32 fields.
-    const GET_DEV_INFO: Opcode = opcode::read_write::<[u32; 9]>(b'd', 0x43);
-    let mut devices = Vec::new();
-    for entry in fs::read_dir("/dev/dri")? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if !name.to_str().is_some_and(|s| s.starts_with("renderD")) {
-            continue;
-        }
-        let path = Path::new("/dev/dri").join(&name);
-        let file = OpenOptions::new().read(true).write(true).open(&path)?;
-        if drm_driver_name(&file)? != "nvidia-drm" {
-            continue;
-        }
-        let mut fields = [0_u32; 9];
-        // SAFETY: this owned descriptor belongs to the verified NVIDIA proxy.
-        unsafe { ioctl(&file, Updater::<GET_DEV_INFO, _>::new(&mut fields)) }
-            .context("query NVIDIA proxy device capabilities")?;
-        devices.push(json!({
-            "render_node":path,
-            "supports_alloc":fields[3] != 0,
-            "supports_sync_fd":fields[7] != 0,
-            "supports_semsurf":fields[8] != 0,
-        }));
-    }
-    ensure!(
-        !devices.is_empty(),
-        "no NVIDIA proxy render node for capability query"
-    );
-    Ok(json!({"devices":devices,"error":null}))
-}
-
-/// Observe the disposable guest's scheduling inputs after the workload.
+/// Record the guest CPU environment alongside rendering diagnostics.
 fn cpu_environment() -> Value {
     let mut caches = std::collections::BTreeSet::new();
     if let Ok(cpus) = fs::read_dir("/sys/devices/system/cpu") {
@@ -474,8 +412,9 @@ fn interrupt_report() -> Result<Value> {
 }
 
 fn run_vulkan_program(program: &str, args: &[&str], name: &str) -> Result<Value> {
-    let stdout = format!("/tmp/{name}.stdout");
-    let stderr = format!("/tmp/{name}.stderr");
+    record_stage(name)?;
+    let stdout = format!("/frames/{name}.stdout");
+    let stderr = format!("/frames/{name}.stderr");
     let status = Command::new(program)
         .args(args)
         .env_clear()
@@ -534,56 +473,4 @@ fn load_modules() -> Result<Vec<String>> {
         modules.push(name.to_owned());
     }
     Ok(modules)
-}
-
-fn inspect() -> Result<Value> {
-    let modules = load_modules()?;
-    let mut bound_devices = Vec::new();
-    for entry in fs::read_dir("/sys/bus/virtio/devices")? {
-        let entry = entry?;
-        let driver = fs::read_link(entry.path().join("driver")).ok();
-        if driver.as_ref().and_then(|path| path.file_name())
-            == Some(std::ffi::OsStr::new("virtio-gpu-nv"))
-        {
-            bound_devices.push(entry.file_name().to_string_lossy().into_owned());
-        }
-    }
-    ensure!(
-        !bound_devices.is_empty(),
-        "NVIDIA virtio driver did not bind; inspect guest kernel log"
-    );
-    let _control = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/nvidiactl")
-        .context("open guest NVIDIA control device")?;
-    let _device = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/nvidia0")
-        .context("open guest NVIDIA GPU device")?;
-    let version = fs::read_to_string("/proc/driver/nvidia/version")?;
-    let mut render_nodes = Vec::new();
-    for entry in fs::read_dir("/dev/dri").context("list guest DRM devices")? {
-        let entry = entry?;
-        if entry.file_name().as_encoded_bytes().starts_with(b"renderD") {
-            let _render = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(entry.path())
-                .context("open guest DRM render node")?;
-            render_nodes.push(entry.path().to_string_lossy().into_owned());
-        }
-    }
-    ensure!(
-        !render_nodes.is_empty(),
-        "guest has no usable DRM render node"
-    );
-    Ok(json!({
-        "schema": 1, "passed": true, "driver_bound": true,
-        "nvidia_control_open": true, "nvidia_device_open": true,
-        "bound_devices": bound_devices, "render_nodes": render_nodes,
-        "driver_version": version.trim(), "loaded_modules": modules,
-        "error": null,
-    }))
 }

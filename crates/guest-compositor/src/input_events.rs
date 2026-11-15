@@ -49,6 +49,12 @@ pub(crate) struct InputState {
 }
 
 impl State {
+    pub(crate) fn cursor_position(&self) -> (i32, i32) {
+        (
+            self.ordered_input.position.0.round() as i32,
+            self.ordered_input.position.1.round() as i32,
+        )
+    }
     pub(crate) fn input_diagnostics(&self) -> serde_json::Value {
         serde_json::json!({
             "position": self.ordered_input.position,
