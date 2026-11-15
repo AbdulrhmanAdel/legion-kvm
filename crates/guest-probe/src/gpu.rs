@@ -187,21 +187,13 @@ fn inspect_vulkan() -> Result<Value> {
     )?;
     let expected = selected_gpu()?;
     let info = run_vulkan_program("/usr/bin/vulkaninfo", &["--summary"], "vulkaninfo")?;
-    let text = info["stdout"].as_str().unwrap_or_default();
-    let selection = super::gpu_kind::verify_host_gpu(&fs::read_to_string("/proc/cmdline")?, text);
-    let vendor = text.contains("DRIVER_ID_MESA_VENUS");
-    let hardware = text.lines().any(|line| {
-        line.split_once('=').is_some_and(|(key, value)| {
-            key.trim() == "deviceType"
-                && (value.contains("DISCRETE_GPU") || value.contains("INTEGRATED_GPU"))
-        })
-    });
-    if info["success"] != true || !vendor || !hardware || selection.is_err() {
+    if let Err(error) =
+        super::gpu_kind::verify_enumeration(&fs::read_to_string("/proc/cmdline")?, &info)
+    {
         return Ok(
             json!({"schema": 1, "passed": false, "enumeration_verified": false, "draw_verified": false,
                 "expected_vendor":expected.vendor_id(),"selected_icd":expected.icd(),
-
-                "vulkaninfo": info, "error": selection.err().map_or_else(|| "selected hardware Vulkan enumeration failed".to_owned(), |error| error.to_string())}),
+                "vulkaninfo": info, "error": error.to_string()}),
         );
     }
     fs::write(

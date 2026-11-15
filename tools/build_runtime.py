@@ -169,6 +169,7 @@ def qemu(source):
 
 def venus(source):
     patch(source,ROOT/'patches/mesa-venus-feedback-poll-experimental.patch')
+    patch(source,ROOT/'patches/mesa-device-select-groups.patch')
     build=OUT/'mesa-venus'
     options=['-Dvulkan-drivers=virtio','-Dvulkan-layers=device-select','-Dgallium-drivers=',
         '-Dplatforms=x11,wayland','-Dllvm=disabled','-Dglx=disabled','-Degl=disabled',
@@ -309,7 +310,7 @@ def main():
                    tree_hash([ROOT/'guest-cpuid'])],lambda:kernel(assets['linux-6.18.62.tar.xz']))
     step('virgl-venus',[identity,sha(ROOT/'config/sources.json'),sha(ROOT/'patches/virgl-venus-sync-fd-experimental.patch'),sha(ROOT/'patches/virgl-venus-ring-poll-experimental.patch')],lambda:virgl(assets['virglrenderer-1.3.0.tar.gz']))
     step('qemu-venus',[identity,sha(ROOT/'config/sources.json'),sha(ROOT/'patches/qemu-display.patch'),sha(ROOT/'patches/qemu-desktop-input.patch')],lambda:qemu(assets['qemu-11.1.2.tar.xz']))
-    step('venus',[identity,sha(ROOT/'config/sources.json'),sha(ROOT/'patches/mesa-venus-feedback-poll-experimental.patch')],lambda:venus(assets['mesa-26.2.6.tar.xz']))
+    step('venus',[identity,sha(ROOT/'config/sources.json'),sha(ROOT/'patches/mesa-venus-feedback-poll-experimental.patch'),sha(ROOT/'patches/mesa-device-select-groups.patch')],lambda:venus(assets['mesa-26.2.6.tar.xz']))
     if os.environ.get('LEGION_WINE_REPAIR') == '1':
         step('wine',[identity,sha(ROOT/'config/sources.json'),sha(ROOT/'patches/wine-runtime.patch')],lambda:wine(assets['wine-c53678ab.tar.gz']))
     step('rust',[identity,os.environ.get('LEGION_BUILD_ID','development'),tree_hash([ROOT/'src',ROOT/'crates',ROOT/'Cargo.toml',ROOT/'Cargo.lock'])],rust)

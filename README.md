@@ -70,14 +70,19 @@ Runtime extraction is cached under `XDG_CACHE_HOME/legion`.
 The Venus cutover is tested on an RTX 4070 Ti SUPER with NVIDIA 620.70.06;
 the earlier performance studies used 615.78.08. The Ryzen 9800X3D integrated
 Radeon 610M also passed D3D11 pixel checks and D3D12 pixel/presentation checks
-through Venus using a private RADV 25.0.7 host driver. Other GPU/driver
-combinations and 32-bit games still require qualification.
+through Venus using a private RADV 25.0.7 host driver. RADV 26.2.6 also passes
+guest enumeration and a synthetic GPU pixel check on that integrated GPU,
+including selection with both AMD and NVIDIA host drivers visible. Other
+GPU/driver combinations and 32-bit games still require qualification.
 
 An AMD kernel driver alone is insufficient: the host also needs an AMD Vulkan
 driver (for example, `vulkan-radeon` on Arch-based systems). Normal sessions
 verify that the guest Vulkan vendor/device IDs match the selected render node
 before starting the application. Missing drivers or a conflicting
 `VK_DRIVER_FILES` setting must fail rather than silently use another GPU.
+Host Vulkan driver overrides and filters inherited from launchers are recorded
+in `vm/report.json` under `host_vulkan_environment`. Their manifests must be
+usable by Legion's 64-bit host renderer, outside any runner container.
 NVAPI/NGX integration is disabled on this path pending separate validation.
 
 ## Building

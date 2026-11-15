@@ -35,6 +35,36 @@ impl GpuKind {
     }
 }
 
+/// Preserve loader failures before checking the identity of enumerated devices.
+pub fn verify_enumeration(cmdline: &str, info: &serde_json::Value) -> Result<()> {
+    if info["success"] != true {
+        let detail: String = info["stderr"]
+            .as_str()
+            .and_then(|text| text.lines().rev().find(|line| !line.trim().is_empty()))
+            .unwrap_or("no Vulkan loader diagnostic")
+            .chars()
+            .take(768)
+            .collect();
+        bail!(
+            "guest Vulkan initialization failed (exit {}, signal {}): {detail}; inspect frames/vulkaninfo.stderr and qemu.log for host driver loading errors",
+            info["exit_code"],
+            info["signal"]
+        );
+    }
+    let text = info["stdout"].as_str().unwrap_or_default();
+    let hardware = text.lines().any(|line| {
+        line.split_once('=').is_some_and(|(key, value)| {
+            key.trim() == "deviceType"
+                && (value.contains("DISCRETE_GPU") || value.contains("INTEGRATED_GPU"))
+        })
+    });
+    ensure!(
+        text.contains("DRIVER_ID_MESA_VENUS") && hardware,
+        "guest Vulkan enumeration did not expose hardware through Venus"
+    );
+    verify_host_gpu(cmdline, text)
+}
+
 /// Reject a loader's fallback GPU before starting any workload or application.
 pub fn verify_host_gpu(cmdline: &str, summary: &str) -> Result<()> {
     let parameter = |name: &str| -> Result<Option<u16>> {

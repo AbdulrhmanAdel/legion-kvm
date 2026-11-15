@@ -503,7 +503,23 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
     };
     let started = Instant::now();
     let mut retried_window = false;
+    let host_vulkan_environment: serde_json::Map<String, Value> = [
+        "VK_DRIVER_FILES",
+        "VK_ICD_FILENAMES",
+        "VK_ADD_DRIVER_FILES",
+        "VK_LOADER_DRIVERS_SELECT",
+        "VK_LOADER_DRIVERS_DISABLE",
+        "VK_LOADER_LAYERS_ENABLE",
+        "VK_LOADER_LAYERS_DISABLE",
+        "NODEVICE_SELECT",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        std::env::var_os(name).map(|value| (name.to_owned(), json!(value.to_string_lossy())))
+    })
+    .collect();
     let mut report = json!({"schema":1,"passed":false,"render_node":node,
+        "host_vulkan_environment":host_vulkan_environment,
         "expected_gpu":{"vendor_id":vendor_id,"device_id":device_id},
         "hardware_rendering_verified":false,"presentation_included":presentation.is_some() || config.presentation_config.is_some(),
         "desktop_capture_verified":false,"guest_memory":ram.info,

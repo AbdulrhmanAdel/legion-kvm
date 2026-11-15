@@ -1,0 +1,31 @@
+--- a/src/vulkan/device-select-layer/device_select_layer.c
++++ b/src/vulkan/device-select-layer/device_select_layer.c
+@@ -365,6 +365,28 @@
+    if (info->bypass_device_select)
+       return info->EnumeratePhysicalDeviceGroups(instance, pPhysicalDeviceGroupCount,
+                                                  pPhysicalDeviceGroups);
++   /* Keep device groups consistent with force-default enumeration. Venus
++    * cannot translate handles for GPUs hidden by EnumeratePhysicalDevices.
++    * A single exposed device forms a valid singleton group.
++    */
++   if (info->force_default_device) {
++      VkPhysicalDevice device;
++      uint32_t count = 1;
++      VkResult result = device_select_EnumeratePhysicalDevices(instance, &count, &device);
++      if (result != VK_SUCCESS)
++         return result;
++      VK_OUTARRAY_MAKE_TYPED(VkPhysicalDeviceGroupProperties, out, pPhysicalDeviceGroups,
++                             pPhysicalDeviceGroupCount);
++      if (count) {
++         vk_outarray_append_typed(VkPhysicalDeviceGroupProperties, &out, group)
++         {
++            group->physicalDeviceCount = 1;
++            group->physicalDevices[0] = device;
++            group->subsetAllocation = VK_FALSE;
++         }
++      }
++      return vk_outarray_status(&out);
++   }
+    VkResult result =
+       info->EnumeratePhysicalDeviceGroups(instance, &physical_device_group_count, NULL);
+    VK_OUTARRAY_MAKE_TYPED(VkPhysicalDeviceGroupProperties, out, pPhysicalDeviceGroups,

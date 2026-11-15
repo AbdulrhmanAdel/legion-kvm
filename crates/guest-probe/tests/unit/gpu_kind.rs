@@ -1,4 +1,29 @@
 use super::*;
+
+#[test]
+fn loader_failure_is_not_reported_as_a_gpu_identity_mismatch() {
+    let info = serde_json::json!({"success":false,"exit_code":1,"signal":null,
+        "stdout":"","stderr":"Found no drivers!\nvkCreateInstance failed with ERROR_INCOMPATIBLE_DRIVER\n"});
+    let error = verify_enumeration("legion.gpu_vendor=1002 legion.gpu_device=7550", &info)
+        .expect_err("failed Vulkan initialization")
+        .to_string();
+    assert!(error.contains("ERROR_INCOMPATIBLE_DRIVER"));
+    assert!(error.contains("qemu.log"));
+    assert!(!error.contains("selected GPU"));
+}
+
+#[test]
+fn successful_loader_still_requires_the_selected_hardware_through_venus() -> Result<()> {
+    let cmdline = "legion.gpu_vendor=1002 legion.gpu_device=7550";
+    let mut info = serde_json::json!({"success":true,"stdout":
+        "vendorID = 0x1002\ndeviceID = 0x7550\ndeviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\ndriverID = DRIVER_ID_MESA_VENUS\n"});
+    verify_enumeration(cmdline, &info)?;
+    assert!(verify_enumeration("legion.gpu_vendor=1002 legion.gpu_device=13c0", &info).is_err());
+    info["stdout"] =
+        "driverID = DRIVER_ID_MESA_VENUS\ndeviceType = PHYSICAL_DEVICE_TYPE_CPU".into();
+    assert!(verify_enumeration(cmdline, &info).is_err());
+    Ok(())
+}
 #[test]
 fn driver_selection_is_explicit_and_unambiguous() -> Result<()> {
     assert_eq!(

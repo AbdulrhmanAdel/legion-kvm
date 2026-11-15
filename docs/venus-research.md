@@ -192,3 +192,31 @@ Matplotlib and does not launch workloads.
 `tools/report_venus_maintenance7.py` renders the saved maintenance7 follow-up,
 including automatic capabilities, the UE game run and private runtime provenance.
 
+## AMD loader and device-selection audit
+
+The November 15 audit reproduced a reported `vkCreateInstance` failure with a
+private Arch RADV 26.2.6 driver on the integrated Radeon 610M. The host driver
+loaded normally outside Legion, but Legion's older bundled Wayland client
+library lacked `wl_display_dispatch_queue_timeout`. Adding Wayland 1.26.0 to
+the checksummed private host ABI resolves that failure without changing the
+installed host driver. This is a packaging dependency fix, not a GPU model or
+Proton version check.
+
+With both RADV and NVIDIA ICDs visible, the Mesa device-selection layer also
+returned groups containing the GPU hidden from ordinary device enumeration.
+Venus could not translate those hidden handles. The bundled layer now returns
+a singleton group for its selected device when force-default selection is on.
+Both AMD and NVIDIA selection pass with the two ICDs visible.
+
+The same guest loader error can also be reproduced with a stale
+`VK_DRIVER_FILES` path or a `VK_LOADER_DRIVERS_SELECT` filter that hides RADV.
+The failure report now preserves initialization errors before testing device
+identity, and records the inherited driver overrides and filters. These
+overrides remain supported for deliberate use of private host drivers.
+
+Evidence is retained in `build/venus/amd-environment-audit/`: the failing
+sessions, corrected driver-selection matrix, package checksum, and a synthetic
+GPU pixel check with RADV 26.2.6. Driver packages were extracted privately;
+no host packages were installed. This audit does not qualify the RX 9070 XT,
+PBZ compatibility, or game presentation/performance with that driver.
+
