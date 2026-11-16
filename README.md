@@ -19,6 +19,18 @@ Steam launch options:
 /path/to/legion %command%
 ```
 
+For native Faugus, Lutris and Heroic packages, put only `/path/to/legion` in
+the launch-command prefix or wrapper field and keep the launcher's installed
+Proton and prefix selections. Faugus uses **Launch Arguments**, Lutris uses
+**System options → Command prefix**, and Heroic uses **Advanced → Wrapper**.
+Do not append the game executable or `%command%` in those fields.
+See [launcher integration](docs/launcher-integration.md) for supported runners,
+read-only diagnostics and Flatpak limitations.
+
+For an environment toggle, configure `legion auto` as the wrapper, then set
+`LEGION=1` for games that should use the VM. Unset it or use `LEGION=0` to run
+the original launcher command. Use launcher-wide wrapper defaults where available.
+
 An explicit launch can select an installed Proton and Wine prefix:
 
 ```sh

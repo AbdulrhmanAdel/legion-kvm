@@ -10,9 +10,37 @@ pub(crate) struct Application {
     #[serde(default)]
     pub arguments: Vec<String>,
     pub dll_overrides: String,
+    #[serde(default)]
+    pub working_directory: Option<String>,
 }
 
 impl Application {
+    pub fn resolve_working_directory(&self, root: &Path, executable: &Path) -> Result<PathBuf> {
+        let Some(directory) = &self.working_directory else {
+            return executable
+                .parent()
+                .context("application directory missing")
+                .map(Path::to_owned);
+        };
+        ensure!(
+            !directory.is_empty()
+                && Path::new(directory)
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_) | Component::CurDir)),
+            "application working directory must be relative to its share"
+        );
+        let root = root.canonicalize()?;
+        let resolved = root
+            .join(directory)
+            .canonicalize()
+            .context("locate application working directory")?;
+        ensure!(
+            resolved.starts_with(&root) && resolved.is_dir(),
+            "application working directory escapes its share or is not a directory"
+        );
+        Ok(resolved)
+    }
+
     pub fn resolve(&self, root: &Path) -> Result<PathBuf> {
         let relative = Path::new(&self.executable);
         ensure!(

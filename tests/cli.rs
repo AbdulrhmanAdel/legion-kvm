@@ -11,6 +11,108 @@ fn legion() -> Command {
 }
 
 #[test]
+fn launcher_inspection_resolves_umu_without_executing_it_or_creating_a_prefix() {
+    let directory = tempfile::tempdir().expect("launcher fixture");
+    let proton = directory.path().join("Proton with spaces");
+    fs::create_dir_all(proton.join("files/bin")).expect("runner structure");
+    fs::write(proton.join("proton"), b"not executable").expect("runner fixture");
+    fs::write(proton.join("files/bin/wine"), b"not executable").expect("Wine fixture");
+    let exe = directory.path().join("Game.exe");
+    fs::write(&exe, b"not executable").expect("game fixture");
+    let prefix = directory.path().join("prefix-must-not-be-created");
+    let literal = "$(touch unwanted-file); one argument";
+    let output = legion()
+        .args(["inspect-launch", "--", "/nonexistent/umu-run"])
+        .arg(&exe)
+        .arg(literal)
+        .arg("")
+        .env("PROTONPATH", &proton)
+        .env("WINEPREFIX", &prefix)
+        .current_dir(directory.path())
+        .output()
+        .expect("inspect wrapper input");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("launch metadata");
+    assert_eq!(
+        report["launch"]["proton"],
+        proton.to_str().expect("fixture path")
+    );
+    assert_eq!(
+        report["launch"]["prefix"],
+        prefix.to_str().expect("fixture path")
+    );
+    assert_eq!(
+        report["launch"]["arguments"],
+        serde_json::json!([literal, ""])
+    );
+    assert_eq!(report["vm_started"], false);
+    assert_eq!(report["prefix_modified"], false);
+    assert!(!prefix.exists());
+    assert!(!directory.path().join("unwanted-file").exists());
+}
+
+#[test]
+fn automatic_wrapper_preserves_native_arguments_environment_cwd_and_exit_status() {
+    let root = tempfile::tempdir().expect("automatic wrapper fixture");
+    let script = root.path().join("original runner");
+    fs::write(
+        &script,
+        b"#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$LEGION_TEST_VALUE\" \"$1\" \"$2\"\nexit 7\n",
+    )
+    .expect("runner script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("executable runner");
+    let literal = "one argument; $(touch should-not-run)";
+    for value in [None, Some("0")] {
+        let mut command = legion();
+        command.env_remove("LEGION");
+        if let Some(value) = value {
+            command.env("LEGION", value);
+        }
+        let output = command
+            .args(["auto", "--"])
+            .arg(&script)
+            .arg(literal)
+            .arg("")
+            .env("LEGION_TEST_VALUE", "preserved value")
+            .env_remove("HOME")
+            .env_remove("XDG_CACHE_HOME")
+            .current_dir(root.path())
+            .output()
+            .expect("native runner");
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("runner output"),
+            format!("{}\npreserved value\n{literal}\n\n", root.path().display())
+        );
+        assert!(output.stderr.is_empty());
+    }
+    assert!(!root.path().join("should-not-run").exists());
+}
+
+#[test]
+fn automatic_wrapper_rejects_invalid_toggle_and_does_not_run_native_with_legion_enabled() {
+    for (toggle, expected) in [
+        ("invalid", "LEGION must be"),
+        ("1", "selected Proton is missing"),
+    ] {
+        let output = legion()
+            .args(["auto", "/bin/echo", "must-not-execute"])
+            .env("LEGION", toggle)
+            .env_remove("PROTONPATH")
+            .env_remove("WINE")
+            .output()
+            .expect("reject invalid invocation");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
+    }
+}
+
+#[test]
 fn plan_preserves_launcher_arguments_without_shell_evaluation() {
     let directory = tempfile::tempdir().expect("test directory");
     let args = [

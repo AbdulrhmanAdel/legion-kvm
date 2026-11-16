@@ -1586,13 +1586,14 @@ mod linux {
             if phase == "workload"
                 && let Some(application) = &launch.application
             {
-                let working_directory = executable
-                    .parent()
-                    .context("application directory missing")?;
+                let working_directory = application.resolve_working_directory(
+                    Path::new("/run/legion-shares/application"),
+                    &executable,
+                )?;
                 command
                     .args(&application.arguments)
-                    .current_dir(working_directory)
-                    .env("PWD", working_directory)
+                    .current_dir(&working_directory)
+                    .env("PWD", &working_directory)
                     .env(
                         "STEAM_COMPAT_INSTALL_PATH",
                         "/run/legion-shares/application",
@@ -1602,6 +1603,7 @@ mod linux {
                     "/frames/application-launch.json",
                     serde_json::to_vec_pretty(&serde_json::json!({
                     "schema":1,"executable":executable.to_str().context("non-UTF8 application executable")?,"arguments":application.arguments,
+                        "working_directory":working_directory,
                         "dll_overrides":application.dll_overrides,"cpu_adapter":launch.cpu_adapter,
                         "kuser_worker":launch.kuser_worker,"direct_nt":launch.nt_syscall_audit,
                         "wine_dispatch":launch.wine_dispatch_audit,"complete_profile_verified":false
@@ -1665,6 +1667,12 @@ mod linux {
                                 key.as_str(),
                                 "SteamAppId"
                                     | "SteamGameId"
+                                    | "GAMEID"
+                                    | "STORE"
+                                    | "UMU_ID"
+                                    | "WINEESYNC"
+                                    | "WINEFSYNC"
+                                    | "WINE_SIMULATE_WRITECOPY"
                                     | "WINEDEBUG"
                                     | "LANG"
                                     | "LC_ALL"
@@ -1675,6 +1683,11 @@ mod linux {
                     "unsupported forwarded game environment variable"
                 );
                 command.env(key, value);
+            }
+            // Launchers describe the host display here. The guest must use its
+            // own compositor even when a launcher selects X11 on the host.
+            if matches!(launch.vulkan_driver, VulkanDriver::Venus) {
+                command.env("PROTON_ENABLE_WAYLAND", "1");
             }
             if launch.audio_trace && phase == "workload" {
                 command.env(

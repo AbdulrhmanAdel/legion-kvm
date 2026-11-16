@@ -18,6 +18,7 @@ mod venus;
 mod wine_recipe;
 
 use std::ffi::OsString;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -28,8 +29,10 @@ const HELP: &str = "Legion KVM launcher
 Usage:
   legion <launcher command and arguments...>
   legion run --proton /path/to/Proton --prefix /path/to/prefix -- /path/to/application.exe
+  legion auto [--] <launcher command and arguments...>
   legion doctor
   legion doctor --graphics
+  legion inspect-launch -- <launcher command and arguments...>
   legion cpu-check
   legion readme
   legion --version
@@ -43,6 +46,7 @@ Run as your desktop user with access to /dev/kvm and the graphics device.
 Installed Proton runs unchanged by default; optional Wine repairs are version-checked.
 
 LEGION_RENDER_NODE selects a DRM render node on systems with multiple GPUs.
+LEGION=1 enables the VM when using the optional 'legion auto' wrapper.
 LEGION_MEMORY_MIB sets guest memory in MiB; the default is 12288.
 Games use the guest Wayland compositor through Venus.
 LEGION_STARTUP_UI=auto|window|log|off controls startup feedback.
@@ -83,6 +87,28 @@ fn run(args: Vec<OsString>) -> Result<()> {
         println!("{HELP}");
         return Ok(());
     }
+    if args.first().is_some_and(|arg| arg == "auto") {
+        let tail = &args[1..];
+        let tail = tail.strip_prefix(&[OsString::from("--")]).unwrap_or(tail);
+        anyhow::ensure!(!tail.is_empty(), "auto wrapper needs a launcher command");
+        let enabled = match std::env::var("LEGION") {
+            Ok(value) if value == "1" => true,
+            Ok(value) if value == "0" || value.is_empty() => false,
+            Err(std::env::VarError::NotPresent) => false,
+            _ => bail!("LEGION must be 1 (enabled) or 0 (original launcher command)"),
+        };
+        if !enabled {
+            // exec preserves the runner's arguments, environment, cwd, signals
+            // and exit status, without extracting a runtime or initializing KVM.
+            return Err(std::process::Command::new(&tail[0]).args(&tail[1..]).exec())
+                .context("execute original launcher command");
+        }
+        let forwarded: Vec<_> = std::iter::once(OsString::from("run"))
+            .chain(tail.iter().cloned())
+            .collect();
+        packed::enter(&forwarded)?;
+        return game::run(tail);
+    }
     packed::enter(&args)?;
     let Some((command, tail)) = args.split_first() else {
         println!("{HELP}");
@@ -98,6 +124,7 @@ fn run(args: Vec<OsString>) -> Result<()> {
         }
         Some("venus-probe" | "drm-native-probe") => venus::run(tail)?,
         Some("run") => game::run(tail)?,
+        Some("inspect-launch") => game::inspect_launch(tail)?,
         Some("--") => game::run(tail)?,
         Some("cpu-check") => game::cpu_check(tail)?,
         Some("doctor") if tail == [OsString::from("--graphics")] => game::graphics_check()?,

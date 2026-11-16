@@ -125,15 +125,29 @@ pub(crate) fn cpu_check(args: &[OsString]) -> Result<()> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
 struct Request {
     proton: PathBuf,
     executable: PathBuf,
     root: PathBuf,
     prefix: Option<PathBuf>,
+    compatdata: Option<PathBuf>,
     arguments: Vec<String>,
+    working_directory: Option<PathBuf>,
+    mangohud: bool,
 }
 
 fn parse(args: &[OsString]) -> Result<Request> {
+    parse_with_env(args, &|name| std::env::var_os(name))
+}
+
+fn proton_root(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|root| root.join("proton").is_file() && root.join("files/bin/wine").is_file())
+        .map(Path::to_owned)
+}
+
+fn parse_with_env(args: &[OsString], env: &impl Fn(&str) -> Option<OsString>) -> Result<Request> {
     let mut proton = None;
     let mut prefix = None;
     let mut explicit_root = None;
@@ -159,19 +173,30 @@ fn parse(args: &[OsString]) -> Result<Request> {
         }
     }
     let launch = &args[index..];
-    let proton_at = launch.iter().position(|p| {
+    let executable_at = launch.iter().position(|p| {
+        Path::new(p)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+    });
+    let before_game = &launch[..executable_at.unwrap_or(launch.len())];
+    let proton_at = before_game.iter().position(|p| {
         Path::new(p).file_name().is_some_and(|n| n == "proton")
             && Path::new(p)
                 .parent()
                 .is_some_and(|root| root.join("files/bin/wine").is_file())
     });
     let exe_at = if let Some(at) = proton_at {
-        proton = Some(
-            PathBuf::from(&launch[at])
-                .parent()
-                .context("Proton parent missing")?
-                .to_owned(),
-        );
+        let selected = PathBuf::from(&launch[at])
+            .parent()
+            .context("Proton parent missing")?
+            .to_owned();
+        if let Some(explicit) = &proton {
+            ensure!(
+                explicit.canonicalize()? == selected.canonicalize()?,
+                "--proton conflicts with the launcher's selected Proton"
+            );
+        }
+        proton = Some(selected);
         ensure!(
             matches!(
                 launch.get(at + 1).and_then(|v| v.to_str()),
@@ -182,13 +207,59 @@ fn parse(args: &[OsString]) -> Result<Request> {
         at + 2
     } else {
         if proton.is_none() {
-            proton = std::env::var_os("PROTONPATH").map(PathBuf::from);
+            proton = env("PROTONPATH")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from);
+            // Lutris also exports the selected Wine executable. Use its owning
+            // Proton when UMU's PROTONPATH is an unresolved selection token.
+            if proton.as_ref().is_none_or(|path| !path.is_absolute())
+                && let Some(root) = env("WINE")
+                    .as_deref()
+                    .and_then(|path| proton_root(Path::new(path)))
+            {
+                proton = Some(root);
+            }
         }
-        launch.iter().position(|p|Path::new(p).extension().is_some_and(|e|e.eq_ignore_ascii_case("exe"))).context("supply legion --proton /installed/Proton -- /path/game.exe, or use legion %command%")?
+        let runner_at = before_game.iter().position(|p| {
+            Path::new(p)
+                .file_name()
+                .is_some_and(|name| matches!(name.to_str(), Some("umu-run" | "wine" | "wine64")))
+        });
+        if let Some(at) = runner_at {
+            if proton.is_none() {
+                proton = proton_root(Path::new(&launch[at]));
+            }
+            let at = at + 1 + usize::from(launch.get(at + 1).is_some_and(|v| v == "--"));
+            ensure!(
+                launch.get(at).is_some_and(|p| Path::new(p)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("exe"))),
+                "launcher runner must be followed by its game .exe; setup commands and UMU config files are not game launches"
+            );
+            at
+        } else {
+            ensure!(
+                proton.is_some(),
+                "selected Proton is missing; use your launcher's Proton runner and put Legion in its wrapper/command-prefix field"
+            );
+            executable_at.context("game executable is missing from launcher command")?
+        }
     };
-    let proton = proton
-        .context("selected Proton is missing; use --proton or your launcher's Proton command")?
-        .canonicalize()?;
+    let proton =
+        proton.context("selected Proton is missing; select a Proton runner in your launcher")?;
+    let proton = if proton.is_absolute() || proton.join("proton").is_file() {
+        proton
+    } else {
+        let home = PathBuf::from(env("HOME").context("HOME is missing")?);
+        let data = env("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share"));
+        let config = env("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config"));
+        [data.join("Steam/compatibilitytools.d"), home.join(".steam/root/compatibilitytools.d"),
+            data.join("umu/compatibilitytools"), data.join("lutris/runners/wine"),
+            data.join("lutris/runners/proton"), config.join("heroic/tools/proton")]
+            .into_iter().map(|root| root.join(&proton))
+            .find(|path| path.join("proton").is_file())
+            .with_context(|| format!("launcher has not resolved Proton selection {:?}; install/select a concrete Proton runner in the launcher", proton))?
+    }.canonicalize().context("locate the launcher's selected Proton")?;
     ensure!(
         proton.join("proton").is_file(),
         "selected directory contains no Proton"
@@ -197,7 +268,7 @@ fn parse(args: &[OsString]) -> Result<Request> {
         PathBuf::from(launch.get(exe_at).context("game executable is missing")?).canonicalize()?;
     ensure!(executable.is_file(), "game executable is not a file");
     let root = explicit_root
-        .or_else(|| std::env::var_os("STEAM_COMPAT_INSTALL_PATH").map(PathBuf::from))
+        .or_else(|| env("STEAM_COMPAT_INSTALL_PATH").map(PathBuf::from))
         .filter(|p| executable.starts_with(p))
         .or_else(|| {
             executable
@@ -225,13 +296,51 @@ fn parse(args: &[OsString]) -> Result<Request> {
                 .map(str::to_owned)
         })
         .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        !arguments.iter().any(|arg| Path::new(arg)
+            .file_name()
+            .is_some_and(|name| name == "umu-run")),
+        "a launcher command was appended after the game executable; put only Legion's path in the wrapper/command-prefix field"
+    );
+    let prefix = prefix.or_else(|| {
+        env("WINEPREFIX")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    let compatdata = env("STEAM_COMPAT_DATA_PATH")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let working_directory = std::env::current_dir()?.canonicalize()?;
+    let working_directory = working_directory
+        .starts_with(&root)
+        .then_some(working_directory);
+    let mangohud = launch[..exe_at].iter().any(|arg| {
+        Path::new(arg)
+            .file_name()
+            .is_some_and(|name| name == "mangohud")
+    });
     Ok(Request {
         proton,
         executable,
         root,
         prefix,
+        compatdata,
         arguments,
+        working_directory,
+        mangohud,
     })
+}
+
+/// Resolve wrapper input without starting a VM, executing a runner or modifying a prefix.
+pub(crate) fn inspect_launch(args: &[OsString]) -> Result<()> {
+    let request = parse(args)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema":1,"launch":request,"vm_started":false,"prefix_modified":false
+        }))?
+    );
+    Ok(())
 }
 
 fn copy(source: &Path, target: &Path) -> Result<()> {
@@ -329,9 +438,7 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
             readonly: false,
         },
     ];
-    let selected_prefix = request
-        .prefix
-        .or_else(|| std::env::var_os("WINEPREFIX").map(PathBuf::from));
+    let selected_prefix = request.prefix;
     let (compatdata, wine_prefix) = if let Some(selected) = selected_prefix {
         let paths = crate::prefix::resolve(&selected, &state)?;
         shares.push(Source {
@@ -343,8 +450,8 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
     } else {
         (
             directory(
-                &std::env::var_os("STEAM_COMPAT_DATA_PATH")
-                    .map(PathBuf::from)
+                &request
+                    .compatdata
                     .unwrap_or_else(|| state.join("compatdata")),
             )?,
             None,
@@ -426,6 +533,12 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
                     k.as_str(),
                     "SteamAppId"
                         | "SteamGameId"
+                        | "GAMEID"
+                        | "STORE"
+                        | "UMU_ID"
+                        | "WINEESYNC"
+                        | "WINEFSYNC"
+                        | "WINE_SIMULATE_WRITECOPY"
                         | "WINEDEBUG"
                         | "LANG"
                         | "LC_ALL"
@@ -446,10 +559,23 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
     launch["uid"] = uid.into();
     launch["gid"] = gid.into();
     crate::wine_recipe::configure(&mut launch, overlay);
-    launch["mangohud"] = std::env::var("MANGOHUD").is_ok_and(|v| v == "1").into();
+    launch["mangohud"] =
+        (request.mangohud || std::env::var("MANGOHUD").is_ok_and(|v| v == "1")).into();
     launch["environment"] = serde_json::to_value(environment)?;
     launch["host_paths"] = serde_json::json!({"home":home,"proton":request.proton,"application":request.root,"compatdata":compatdata,"wine_prefix":wine_prefix});
     launch["application"] = serde_json::json!({"executable":request.executable.strip_prefix(&request.root)?.to_str().context("non-UTF8 game path")?,"arguments":request.arguments,"dll_overrides":overrides});
+    if let Some(cwd) = &request.working_directory {
+        let relative = cwd.strip_prefix(&request.root)?;
+        launch["application"]["working_directory"] = if relative.as_os_str().is_empty() {
+            ".".into()
+        } else {
+            serde_json::json!(
+                relative
+                    .to_str()
+                    .context("non-UTF8 game working directory")?
+            )
+        };
+    }
     fs::write(
         fixture.join("launch.json"),
         serde_json::to_vec_pretty(&launch)?,
